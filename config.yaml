@@ -1,0 +1,94 @@
+# Photo Curator Configuration
+# All paths are relative to the photo_curator/ directory
+
+paths:
+  input:  "data/input_photos"
+  output: "data/output_photos"
+  cache:  "cache/photo_db.sqlite"
+  models: "models"
+
+ingestion:
+  supported_extensions: [".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".bmp", ".webp"]
+  max_dimension: 1024       # resize to this before processing (memory / speed)
+  batch_size: 16
+
+quality:
+  min_blur_score: 50.0      # Laplacian variance — below this = blurry
+  min_exposure_score: 0.15  # mean brightness 0–1
+  max_exposure_score: 0.90
+  min_resolution: 640       # shorter side in pixels
+
+deduplication:
+  phash_threshold: 8        # Hamming distance (0 = exact, 8 = very similar)
+  embedding_similarity: 0.95  # cosine similarity floor for visual duplicates
+
+privacy:
+  filter_screenshots: true
+  filter_documents: true      # CLIP zero-shot doc/ID detection
+  filter_home_private: false  # enable to filter solo shots at home
+  home_coords: null           # [lat, lon] or null
+  home_radius_km: 0.5
+
+clustering:
+  time_weight: 1.0
+  gps_weight: 2.0
+  visual_weight: 1.5
+  eps: 0.6
+  min_samples: 2
+
+# ── Aesthetic Scoring ───────────────────────────────────────────────────────
+aesthetic:
+  use_laion_predictor: false  # true = download LAION MLP (more accurate)
+                               # false = CLIP zero-shot proxy (instant, offline)
+
+# ── Scene Tagging ───────────────────────────────────────────────────────────
+scene_tagging:
+  enabled: true
+  top_n: 3              # number of scene labels to store per photo
+
+# ── Facial Sentiment ────────────────────────────────────────────────────────
+sentiment:
+  enabled: true
+  min_face_for_sentiment: 1  # only run on photos with ≥ N faces
+
+# ── Face Identity Clustering ────────────────────────────────────────────────
+face_clustering:
+  enabled: true
+  eps: 0.8                     # DBSCAN eps for face embeddings (0.6–1.0)
+  min_samples: 2
+  frequent_person_threshold: 5 # min photos to be classified as "frequent person"
+
+# ── Ranking weights (must sum to ~1.0) ──────────────────────────────────────
+ranking:
+  weights:
+    sharpness:           0.15
+    aesthetic:           0.25   # CLIP / LAION aesthetic score
+    face_score:          0.15
+    sentiment:           0.15   # smile + eyes open (MediaPipe)
+    uniqueness:          0.15
+    metadata_importance: 0.08
+    diversity_bonus:     0.07
+
+# ── Selection — 30 / 30 / 40 diversity strategy ─────────────────────────────
+selection:
+  max_output_bytes: 1_073_741_824   # 1 GB
+
+  # Bucket fractions (must sum to 1.0)
+  people_budget_fraction:    0.30  # top photos per frequent person
+  location_budget_fraction:  0.30  # top photos per GPS cluster
+  aesthetic_budget_fraction: 0.40  # highest overall scores
+
+  # Per-bucket caps
+  max_per_person:   5    # max photos of any single identified person
+  max_per_location: 15   # max photos from any single location cluster
+  max_per_cluster:  10   # event-cluster cap (backup diversity guard)
+
+  # Output resizing — dramatically increases photos that fit in 1 GB
+  resize_output:       true
+  output_long_side:    2560   # pixels — good for 2K/4K displays
+  output_jpeg_quality: 92     # 85–95 recommended
+
+output:
+  copy_files: true
+  generate_report: true
+  report_filename: "output.json"
