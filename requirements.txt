@@ -8,11 +8,14 @@
 torch>=2.1.0
 torchvision>=0.16.0
 
+# NOTE: numpy<2.0 and Pillow<10.3 are required by facenet-pytorch and mediapipe
+numpy>=1.24.0,<2.0.0
+Pillow>=10.0.0,<10.3.0
+
 # Face detection and embeddings
 facenet-pytorch>=2.5.3
 
-# Image I/O
-Pillow>=10.0.0
+# Image I/O  (upper bound set by facenet-pytorch + mediapipe compatibility)
 pillow-heif>=0.13.0        # HEIC/HEIF support (iPhone photos)
 
 # EXIF metadata

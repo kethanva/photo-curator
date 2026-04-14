@@ -193,6 +193,14 @@ def copy_to_output(
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    
+    # Clean previous output to prevent accumulating duplicates with _1 suffixes
+    for old_file in out.glob("*"):
+        if old_file.is_file() and old_file.name != ".gitkeep":
+            try:
+                old_file.unlink()
+            except Exception:
+                pass
 
     report: List[dict] = []
     copied = 0

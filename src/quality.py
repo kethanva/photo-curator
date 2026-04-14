@@ -50,9 +50,9 @@ def resolution(img: Image.Image) -> int:
 
 def assess(
     img: Image.Image,
-    min_blur: float = 50.0,
-    min_exposure: float = 0.15,
-    max_exposure: float = 0.90,
+    min_blur_score: float = 50.0,
+    min_exposure_score: float = 0.15,
+    max_exposure_score: float = 0.90,
     min_resolution: int = 640,
 ) -> QualityResult:
     """
@@ -60,9 +60,9 @@ def assess(
 
     Args:
         img: PIL Image (RGB)
-        min_blur: minimum Laplacian variance to pass
-        min_exposure: minimum mean brightness (0–1)
-        max_exposure: maximum mean brightness (0–1)
+        min_blur_score: minimum Laplacian variance to pass
+        min_exposure_score: minimum mean brightness (0–1)
+        max_exposure_score: maximum mean brightness (0–1)
         min_resolution: minimum shorter dimension in pixels
 
     Returns:
@@ -72,8 +72,8 @@ def assess(
     e = exposure_score(img)
     r = resolution(img)
     passes = (
-        b >= min_blur
-        and min_exposure <= e <= max_exposure
+        b >= min_blur_score
+        and min_exposure_score <= e <= max_exposure_score
         and r >= min_resolution
     )
     return QualityResult(blur_score=b, exposure_score=e, resolution=r, passes=passes)

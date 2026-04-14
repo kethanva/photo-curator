@@ -119,7 +119,7 @@ def find_duplicates_ann(
     store: "VectorStore",
     phash_threshold: int = 8,
     embedding_threshold: float = 0.95,
-    ann_k: int = 30,
+    ann_k: int = 100,
 ) -> Set[str]:
     """
     ANN-accelerated duplicate detection.
@@ -127,7 +127,7 @@ def find_duplicates_ann(
     For each candidate photo the vector store is queried for its K nearest
     CLIP neighbours.  Only those neighbours that have already been accepted
     are checked for similarity — reducing the comparison cost from O(N²) to
-    O(N·K) where K is small (default 30).
+    O(N·K) where K is small (default 100).
 
     pHash and exact file-hash checks are still O(N·N_accepted) but those
     comparisons are cheap (integer XOR / dict lookup).
@@ -167,8 +167,7 @@ def find_duplicates_ann(
         if not is_dup and accepted_paths:
             emb = rec.get("clip_emb")
             if emb is not None:
-                k = min(ann_k, len(accepted_paths))
-                candidates = store.search_clip(emb, n_results=k)
+                candidates = store.search_clip(emb, n_results=ann_k)
                 for cand_path, dist in candidates:
                     if cand_path not in accepted_paths:
                         continue
