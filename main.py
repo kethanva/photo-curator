@@ -50,6 +50,7 @@ from src import (
     scene_tagger,
     selection,
     sentiment,
+    subject_priority,
     vector_store as vs,
 )
 
@@ -415,16 +416,26 @@ def stage_face_clustering(cfg: dict, db_path: str, store: "vs.VectorStore") -> N
 
 def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool) -> tuple:
     """Stage 9: Rank, select (30/30/40), and write output."""
-    rank_cfg = cfg["ranking"]["weights"]
-    sel_cfg  = cfg["selection"]
-    out_cfg  = cfg["output"]
+    rank_cfg    = cfg["ranking"]["weights"]
+    sel_cfg     = cfg["selection"]
+    out_cfg     = cfg["output"]
+    subj_cfg    = cfg.get("subject_priority", {})
 
     with database.connect(db_path) as conn:
         rows    = database.get_all(conn, "quality_pass=1 AND is_private=0 AND is_duplicate=0")
         records = [dict(r) for r in rows]
 
-    # Score
-    scores = ranking.score_photos(records, rank_cfg)
+    # ── Subject priority scores ───────────────────────────────────
+    subject_scores = None
+    if subj_cfg.get("enabled", False) and subj_cfg.get("subjects"):
+        print(f"  Computing subject priority scores "
+              f"({len(subj_cfg['subjects'])} subjects)…")
+        subject_scores = subject_priority.compute_scores(records, subj_cfg)
+        matched = sum(1 for v in subject_scores.values() if v > 0.01)
+        print(f"  Subject boost applied to {matched}/{len(records)} photos")
+
+    # ── Score ─────────────────────────────────────────────────────
+    scores = ranking.score_photos(records, rank_cfg, subject_scores=subject_scores)
 
     with database.connect(db_path) as conn:
         for path, score in scores.items():
@@ -433,7 +444,10 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool) -> tuple:
 
     print(f"  Scored {len(scores)} photos")
 
-    # Select
+    # ── Select ────────────────────────────────────────────────────
+    output_mode = sel_cfg.get("output_mode", "percentage")
+    output_pct  = sel_cfg.get("output_percentage", 0.15)
+
     selected = selection.select_photos(
         records,
         scores,
@@ -446,9 +460,15 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool) -> tuple:
         aesthetic_fraction=sel_cfg.get("aesthetic_budget_fraction", 0.40),
         output_long_side=sel_cfg.get("output_long_side", 2560),
         output_jpeg_quality=sel_cfg.get("output_jpeg_quality", 92),
+        output_mode=output_mode,
+        output_percentage=output_pct,
     )
 
-    print(f"  Selected {len(selected)} photos")
+    pct_label = (
+        f" ({output_pct*100:.0f}% of {len(records)} eligible)"
+        if output_mode == "percentage" else ""
+    )
+    print(f"  Selected {len(selected)} photos{pct_label}")
 
     if not dry_run:
         selection.copy_to_output(

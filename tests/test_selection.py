@@ -196,3 +196,98 @@ class TestSizeEstimation:
         scores = _scores(recs, 0.5)
         result = select_photos(recs, scores, max_bytes=100_000_000)
         assert isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------
+# Percentage mode tests
+# ---------------------------------------------------------------------------
+
+class TestPercentageMode:
+    def _make_pool(self, n: int) -> tuple:
+        recs = [_rec(f"img{i}.jpg") for i in range(n)]
+        scores = {r["path"]: float(i) / n for i, r in enumerate(recs)}
+        return recs, scores
+
+    def test_percentage_mode_selects_correct_count(self):
+        """15% of 100 eligible photos = 15 photos."""
+        recs, scores = self._make_pool(100)
+        result = select_photos(
+            recs, scores,
+            max_bytes=500_000_000,
+            output_mode="percentage",
+            output_percentage=0.15,
+        )
+        assert len(result) == 15
+
+    def test_percentage_mode_rounds_down(self):
+        """int(7 * 0.15) = 1; should return 1 photo."""
+        recs, scores = self._make_pool(7)
+        result = select_photos(
+            recs, scores,
+            max_bytes=500_000_000,
+            output_mode="percentage",
+            output_percentage=0.15,
+        )
+        assert len(result) == max(1, int(7 * 0.15))
+
+    def test_percentage_mode_at_least_one(self):
+        """Even very small percentage of a tiny pool returns ≥ 1 photo."""
+        recs, scores = self._make_pool(3)
+        result = select_photos(
+            recs, scores,
+            max_bytes=500_000_000,
+            output_mode="percentage",
+            output_percentage=0.01,
+        )
+        assert len(result) >= 1
+
+    def test_percentage_mode_100_percent(self):
+        """100% should return all eligible photos (subject to byte cap)."""
+        recs, scores = self._make_pool(20)
+        result = select_photos(
+            recs, scores,
+            max_bytes=500_000_000,
+            output_mode="percentage",
+            output_percentage=1.0,
+        )
+        assert len(result) == 20
+
+    def test_bytes_mode_ignores_percentage(self):
+        """In bytes mode, output_percentage is irrelevant."""
+        recs, scores = self._make_pool(50)
+        # Tight byte cap that allows ~5 photos (each ~500 KB → 2.5 MB limit)
+        result = select_photos(
+            recs, scores,
+            max_bytes=2_500_000,
+            output_mode="bytes",
+            output_percentage=1.0,   # would allow all 50 if mode were percentage
+        )
+        assert len(result) < 50
+
+    def test_byte_cap_still_enforced_in_percentage_mode(self):
+        """Even in percentage mode the hard byte cap prevents overrun."""
+        recs, scores = self._make_pool(100)
+        # Cap so tight only ~1 photo fits
+        result = select_photos(
+            recs, scores,
+            max_bytes=100_000,
+            output_mode="percentage",
+            output_percentage=0.50,
+        )
+        assert len(result) <= 2  # byte cap overrides photo count
+
+    def test_percentage_selects_highest_scored_photos(self):
+        """The selected subset should be the top-N by score."""
+        n = 20
+        recs = [_rec(f"img{i}.jpg") for i in range(n)]
+        scores = {f"img{i}.jpg": i / n for i in range(n)}
+        result = select_photos(
+            recs, scores,
+            max_bytes=500_000_000,
+            output_mode="percentage",
+            output_percentage=0.25,  # top 5
+        )
+        selected_paths = {r["path"] for r in result}
+        # Top 5 by score: img15..img19
+        for i in range(15, 20):
+            assert f"img{i}.jpg" in selected_paths
