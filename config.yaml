@@ -7,6 +7,14 @@ paths:
   cache:  "cache/photo_db.sqlite"
   models: "models"
 
+# ── Vector Store (ChromaDB — local HNSW, no server required) ────────────────
+# Stores CLIP and FaceNet embeddings for O(log N) ANN search.
+# Scales to 1M+ photos without loading all embeddings into RAM.
+vector_store:
+  path:             "cache/vector_store"   # persisted to disk automatically
+  clip_collection:  "clip_embeddings"
+  face_collection:  "face_embeddings"
+
 ingestion:
   supported_extensions: [".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".bmp", ".webp"]
   max_dimension: 1024       # resize to this before processing (memory / speed)

@@ -4,40 +4,40 @@ A local, offline photo intelligence system that processes 10 GB+ photo libraries
 and produces a curated ~1 GB selection. Runs entirely on-device. No cloud uploads.
 Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
 
-===============================================================================
 
 ## TABLE OF CONTENTS
 
-  1. Quick Start
-  2. High Level Design (HLD)
-     2.1  System Context
-     2.2  Component Map
-     2.3  Technology Stack
-     2.4  Design Principles
-  3. Pipeline Flow
-     3.1  End-to-End Pipeline (9 stages)
-     3.2  Single-Photo Data Flow
-     3.3  Selection Strategy (30/30/40)
-  4. Low Level Design (LLD)
-     4.1  Module Reference
-     4.2  Database Schema
-     4.3  Ranking Formula
-     4.4  Deduplication Logic
-     4.5  Clustering Algorithm
-     4.6  Face Identity Clustering
-     4.7  Privacy Filter Chain
-     4.8  Output Resizing
-  5. Module Dependency Graph
-  6. Configuration Reference
-  7. File & Directory Layout
-  8. Performance & Scaling
-  9. Usage
+- [1. QUICK START](#1-quick-start)
+- [2. HIGH LEVEL DESIGN (HLD)](#2-high-level-design-hld)
+  - [2.1  SYSTEM CONTEXT](#21-system-context)
+  - [2.2  COMPONENT MAP](#22-component-map)
+  - [2.3  TECHNOLOGY STACK](#23-technology-stack)
+  - [2.4  DESIGN PRINCIPLES](#24-design-principles)
+- [3. PIPELINE FLOW](#3-pipeline-flow)
+  - [3.1  END-TO-END PIPELINE (9 STAGES)](#31-end-to-end-pipeline-9-stages)
+  - [3.2  SINGLE-PHOTO DATA FLOW](#32-single-photo-data-flow)
+  - [3.3  SELECTION STRATEGY (30 / 30 / 40)](#33-selection-strategy-30-30-40)
+- [4. LOW LEVEL DESIGN (LLD)](#4-low-level-design-lld)
+  - [4.1  MODULE REFERENCE](#41-module-reference)
+  - [4.2  DATABASE SCHEMA](#42-database-schema)
+  - [4.3  RANKING FORMULA](#43-ranking-formula)
+  - [4.4  DEDUPLICATION LOGIC](#44-deduplication-logic)
+  - [4.5  EVENT CLUSTERING ALGORITHM](#45-event-clustering-algorithm)
+  - [4.6  FACE IDENTITY CLUSTERING](#46-face-identity-clustering)
+  - [4.7  PRIVACY FILTER CHAIN](#47-privacy-filter-chain)
+  - [4.8  OUTPUT RESIZING](#48-output-resizing)
+  - [4.9  VECTOR STORE](#49-vector-store)
+- [5. MODULE DEPENDENCY GRAPH](#5-module-dependency-graph)
+- [6. CONFIGURATION REFERENCE](#6-configuration-reference)
+- [7. FILE & DIRECTORY LAYOUT](#7-file-directory-layout)
+- [8. PERFORMANCE & SCALING](#8-performance-scaling)
+- [9. USAGE](#9-usage)
 
-
-===============================================================================
 ## 1. QUICK START
-===============================================================================
 
+
+
+```bash
     git clone <repo> photo-curator && cd photo-curator
     python3 -m venv .venv && source .venv/bin/activate
     pip install -r requirements.txt
@@ -52,16 +52,20 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     # output + report
     data/output_photos/
     data/output_photos/output.json
+```
 
 
-===============================================================================
+
+
 ## 2. HIGH LEVEL DESIGN (HLD)
-===============================================================================
 
--------------------------------------------------------------------------------
-2.1  SYSTEM CONTEXT
--------------------------------------------------------------------------------
 
+
+### 2.1  SYSTEM CONTEXT
+
+
+
+```text
                           +---------------------------+
                           |        User / Shell       |
                           +-------------|-------------+
@@ -79,6 +83,13 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
                           |           |               |
                           |  +--------v-----------+   |
                           |  |   SQLite Cache DB  |   |
+                          |  |   (metadata only)  |   |
+                          |  +--------------------+   |
+                          |           |               |
+                          |  +--------v-----------+   |
+                          |  | ChromaDB Vector    |   |
+                          |  | Store (HNSW)       |   |
+                          |  | CLIP + face embs   |   |
                           |  +--------------------+   |
                           |           |               |
                           |  +--------v-----------+   |
@@ -97,18 +108,21 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     |  data/input_photos |    | data/output_photos|  |  (curation report)|
     |  (10 GB+, any fmt) |    |  (~1 GB, JPEG)    |  |                   |
     +--------------------+    +-------------------+  +-------------------+
+```
+
 
   Key constraints:
     - Fully offline: no API calls, no cloud storage
     - Incremental: SQLite cache skips already-processed files
     - Resumable: --from-stage N replays from any checkpoint
     - Privacy-first: screenshots, documents, and home shots filtered locally
+    - Scalable: ChromaDB vector store replaces in-memory DBSCAN for 1M+ photos
 
 
--------------------------------------------------------------------------------
-2.2  COMPONENT MAP
--------------------------------------------------------------------------------
 
+### 2.2  COMPONENT MAP
+
+```text
   +===========================================================================+
   |                         PHOTO CURATOR SYSTEM                             |
   +===========================================================================+
@@ -135,7 +149,7 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   |  |-------------------|    |------------------|    |--------------------| |
   |  | deduplication.py  |    | clustering.py    |    | ranking.py        | |
   |  |  - pHash          |    |  - DBSCAN        |    |  - 7 components   | |
-  |  |  - cosine sim     |    |  - PCA reduce    |    |  - weighted score | |
+  |  |  - ANN cosine sim |    |  - PCA reduce    |    |  - weighted score | |
   |  |  - keep sharpest  |    |  - time+GPS+CLIP |    |                   | |
   |  |                   |    |                  |    | selection.py      | |
   |  | privacy.py        |    | face_clustering.py    |  - 30/30/40 split | |
@@ -147,16 +161,22 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   |  +=====================================================================+ |
   |  |                      PERSISTENCE LAYER                             | |
   |  |---------------------------------------------------------------------| |
-  |  |  database.py  ->  cache/photo_db.sqlite                            | |
-  |  |  SQLite WAL mode, one row per photo, all features stored as BLOBs  | |
+  |  |  database.py     ->  cache/photo_db.sqlite  (metadata + scores)    | |
+  |  |  SQLite WAL mode, one row per photo, no embedding BLOBs in hot path| |
+  |  |                                                                     | |
+  |  |  vector_store.py ->  cache/vector_store/    (embeddings)           | |
+  |  |  ChromaDB HNSW, O(log N) ANN search, scales to 1M+ photos         | |
   |  +=====================================================================+ |
   +===========================================================================+
+```
 
 
--------------------------------------------------------------------------------
-2.3  TECHNOLOGY STACK
--------------------------------------------------------------------------------
 
+### 2.3  TECHNOLOGY STACK
+
+
+
+```text
   Category          Library / Tool          Purpose
   ----------------  ----------------------  ---------------------------------
   ML Embeddings     CLIP ViT-B/32 (OpenAI)  512-dim visual embeddings
@@ -165,18 +185,21 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   Sentiment         MediaPipe Face Mesh      468 facial landmarks
   Clustering        scikit-learn DBSCAN      Event + identity grouping
   Dim Reduction     scikit-learn PCA         512 -> 32 for CLIP clustering
+  Vector Store      ChromaDB (HNSW)          O(log N) ANN search, 1M+ scale
   Image I/O         Pillow + pillow-heif     JPEG, PNG, HEIC, TIFF, WebP
   EXIF              piexif                   Timestamp, GPS, camera model
   Perceptual Hash   ImageHash (pHash)        Near-duplicate detection
   Accelerator       PyTorch MPS/CUDA/CPU     M1/M2/M3 or NVIDIA or fallback
-  Cache             SQLite 3 (WAL mode)      Feature store, incremental runs
+  Metadata DB       SQLite 3 (WAL mode)      Scores, flags, incremental runs
   Config            PyYAML                   config.yaml parsing
   Progress          tqdm                     Pipeline progress bars
+```
 
 
--------------------------------------------------------------------------------
-2.4  DESIGN PRINCIPLES
--------------------------------------------------------------------------------
+
+
+### 2.4  DESIGN PRINCIPLES
+
 
   INCREMENTAL
     Every photo is identified by its MD5 hash. On re-run, photos already
@@ -192,7 +215,9 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   MEMORY-EFFICIENT
     Photos are resized to max_dimension (default 1024px) before any ML
     processing. Images are never held in memory across loop iterations.
-    Embeddings are stored as raw float32 BLOBs (512 * 4 = 2 KB each).
+    Embeddings are stored in ChromaDB (HNSW-indexed on disk) rather than
+    loaded wholesale into RAM; stages 6-8 query the store instead of
+    deserialising all SQLite BLOBs at once.
 
   PRIVACY-FIRST
     All processing is local. Privacy filters run before ML scoring so
@@ -206,17 +231,19 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     model singleton to avoid loading CLIP twice.)
 
 
-===============================================================================
+
 ## 3. PIPELINE FLOW
-===============================================================================
 
--------------------------------------------------------------------------------
-3.1  END-TO-END PIPELINE (9 STAGES)
--------------------------------------------------------------------------------
 
-  INPUT: data/input_photos/**  (JPG, PNG, HEIC, TIFF, WebP, BMP)
-  OUTPUT: data/output_photos/  (resized JPEG + output.json)
 
+### 3.1  END-TO-END PIPELINE (9 STAGES)
+
+
+  - **INPUT:** `data/input_photos/**` (JPG, PNG, HEIC, TIFF, WebP, BMP)
+  - **OUTPUT:** `data/output_photos/` (resized JPEG + output.json)
+
+
+```text
   +-------+
   | START |
   +---+---+
@@ -242,7 +269,8 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   |    face_detection -> face_count, avg 512-dim face vector     |
   |    privacy.py     -> is_screenshot / is_document / is_home   |
   |                                                              |
-  |  -> upsert all fields into SQLite photos table               |
+  |  -> upsert metadata into SQLite photos table                 |
+  |  -> upsert CLIP + face embeddings into ChromaDB vector store |
   +---+----------------------------------------------------------+
       |  All features in DB
       v
@@ -276,10 +304,11 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   | STAGE 6: DEDUPLICATION                    deduplication.py  |
   |  - Loads (path, file_hash, phash, clip_emb, blur_score)     |
   |  - Sorts by blur_score DESC (sharpest copy kept)            |
-  |  - For each photo, compares against all kept photos:         |
-  |      Pass 1: exact MD5 match?        -> duplicate           |
-  |      Pass 2: pHash Hamming dist <= 8? -> duplicate          |
-  |      Pass 3: CLIP cosine sim >= 0.95? -> duplicate          |
+  |  - For each photo, checks against already-accepted set:      |
+  |      Pass 1: exact MD5 match?         -> duplicate           |
+  |      Pass 2: ANN search top-30 CLIP   -> cosine sim >= 0.95 |
+  |              (O(N·K) via ChromaDB, not O(N²) brute force)   |
+  |      Pass 3: pHash Hamming dist <= 8? -> duplicate          |
   |  - Marks losers: UPDATE photos SET is_duplicate=1           |
   +---+----------------------------------------------------------+
       |
@@ -287,6 +316,7 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   +---+----------------------------------------------------------+
   | STAGE 7: EVENT CLUSTERING                 clustering.py     |
   |  - WHERE quality_pass=1 AND is_private=0 AND is_duplicate=0 |
+  |  - CLIP embeddings fetched from ChromaDB (not SQLite BLOBs) |
   |  - Builds feature matrix per photo:                         |
   |      col 0   : timestamp  (StandardScaler * time_weight)    |
   |      col 1-2 : lat, lon   (StandardScaler * gps_weight)     |
@@ -299,6 +329,7 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   +---+----------------------------------------------------------+
   | STAGE 8: FACE IDENTITY CLUSTERING         face_clustering.py|
   |  - WHERE face_count >= 1                                    |
+  |  - Face embeddings fetched from ChromaDB (not SQLite BLOBs) |
   |  - L2-normalises all face_emb vectors                       |
   |  - DBSCAN(eps=0.8, metric='euclidean') on face embeddings   |
   |  - person_id = cluster label                                |
@@ -327,12 +358,16 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   +--------+
   | OUTPUT |  data/output_photos/*.jpg  +  output.json
   +--------+
+```
 
 
--------------------------------------------------------------------------------
-3.2  SINGLE-PHOTO DATA FLOW
--------------------------------------------------------------------------------
 
+
+### 3.2  SINGLE-PHOTO DATA FLOW
+
+
+
+```text
   FILE: IMG_1234.HEIC  (4000x3000, 5.2 MB, iPhone 14 Pro)
   |
   +-- ingestion.load_image_safe()
@@ -368,7 +403,10 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   |     is_private = False
   |
   +-- database.upsert()
-  |     -> all fields written to photos table
+  |     -> all metadata fields written to photos table
+  |
+  +-- vector_store.upsert_clip() + upsert_face()
+  |     -> 512-dim CLIP + face vectors written to ChromaDB HNSW index
   |
   [Later, Stage 3 - reading from DB, no image reload needed]
   +-- aesthetic.score_from_embedding(clip_emb)
@@ -412,17 +450,21 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   |
   +-- output: resize 1024x768 -> 853x640  (long side 853 <= 2560, no resize)
         save as data/output_photos/IMG_1234.jpg  (JPEG quality 92)
+```
 
 
--------------------------------------------------------------------------------
-3.3  SELECTION STRATEGY (30 / 30 / 40)
--------------------------------------------------------------------------------
+
+
+### 3.3  SELECTION STRATEGY (30 / 30 / 40)
+
 
   Total budget: 1 073 741 824 bytes (1 GB)
 
   Pre-filter: quality_pass=1, is_duplicate=0, is_private=0
   Sort all candidates by score DESC
 
+
+```text
                     +---------------------------+
                     |   ELIGIBLE PHOTO POOL     |
                     |   (scored, sorted)        |
@@ -457,19 +499,21 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
                     |   resized to 2560px JPEG  |
                     |   data/output_photos/     |
                     +---------------------------+
+```
+
 
   NOTE: Estimated output size uses post-resize bytes, not originals.
         A 12 MP original (~4 MB) -> ~1.5 MB after resize = 2.5x more
         photos fit within the 1 GB budget compared to copying originals.
 
 
-===============================================================================
-## 4. LOW LEVEL DESIGN (LLD)
-===============================================================================
 
--------------------------------------------------------------------------------
-4.1  MODULE REFERENCE
--------------------------------------------------------------------------------
+## 4. LOW LEVEL DESIGN (LLD)
+
+
+
+### 4.1  MODULE REFERENCE
+
 
   src/ingestion.py
   ----------------
@@ -612,12 +656,50 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     XOR the two hex integers, count set bits. Returns 64 on invalid input.
 
   find_duplicates(records, phash_threshold, embedding_threshold) -> Set[str]
+    Brute-force O(N²) fallback (used when vector store is empty).
     Input records sorted by blur_score DESC (sharpest first).
     For each photo, compare against all already-kept photos:
       1. file_hash exact match
       2. hamming_distance(phash) <= phash_threshold   (default 8)
       3. cosine_similarity(clip_emb) >= threshold     (default 0.95)
     Returns Set[path] of photos to mark as duplicates.
+
+  find_duplicates_ann(records, store, phash_threshold,
+                      embedding_threshold, ann_k=30) -> Set[str]
+    ANN-accelerated version. O(N·K) instead of O(N²).
+    For each candidate, queries the VectorStore for its K nearest
+    CLIP neighbours and checks only those that are already accepted.
+    pHash and MD5 checks are still O(N_accepted) but those are cheap.
+    Used by default when store.clip_count() > 0.
+
+  ----------------------------------------
+
+  src/vector_store.py
+  -------------------
+  VectorStore(store_path, clip_collection, face_collection)
+    Opens (or creates) a ChromaDB PersistentClient at store_path.
+    Two collections:
+      clip_embeddings  — cosine distance space (CLIP ViT-B/32)
+      face_embeddings  — L2 distance space (FaceNet)
+
+  upsert_clip(path, emb) / upsert_face(path, emb)
+    Single-item upsert. Called per photo in stage_extract.
+
+  upsert_clip_batch(paths, matrix) / upsert_face_batch(paths, matrix)
+    Chunked batch upsert (5 000 items per chunk). Used during sync.
+
+  search_clip(query, n_results=20) -> List[(path, distance)]
+    ANN search returning (path, cosine_distance) pairs.
+    distance = 1 − cosine_similarity for normalised vectors.
+
+  get_all_clip() / get_all_face() -> (List[str], np.ndarray[N,512])
+    Bulk fetch all embeddings. Used by DBSCAN clustering stages.
+
+  clip_ids() / face_ids() -> set
+    Return all path IDs in a collection. Used during sync.
+
+  clip_count() / face_count() -> int
+    Row count per collection.
 
   ----------------------------------------
 
@@ -717,12 +799,14 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     512 floats = 2 048 bytes per embedding.
 
 
--------------------------------------------------------------------------------
-4.2  DATABASE SCHEMA
--------------------------------------------------------------------------------
+
+### 4.2  DATABASE SCHEMA
+
 
   TABLE: photos
 
+
+```text
   Column            Type     Default    Description
   ----------------  -------  ---------  --------------------------------------
   id                INTEGER  PK         Auto-increment row ID
@@ -772,11 +856,13 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     idx_hash    ON photos(file_hash)    -- fast cache lookup
     idx_cluster ON photos(cluster_id)  -- cluster stats
     idx_person  ON photos(person_id)   -- person queries
+```
 
 
--------------------------------------------------------------------------------
-4.3  RANKING FORMULA
--------------------------------------------------------------------------------
+
+
+### 4.3  RANKING FORMULA
+
 
   All 7 components are min-max normalised to [0,1] before weighting.
   Normalisation is computed across the current eligible photo set
@@ -790,6 +876,8 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
         + w6 * metadata_importance
         + w7 * diversity_bonus
 
+
+```text
   Component            Default  Source
   -------------------  -------  -------------------------------------------
   sharpness            0.15     minmax(blur_score)
@@ -801,6 +889,8 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   diversity_bonus      0.07     minmax(cluster_size / max_cluster_size)
                        ----
   Total                1.00
+```
+
 
   aesthetic_score detail:
     pos_sim = cosine(clip_emb, avg_positive_prompts)
@@ -812,12 +902,11 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     face_count=1 -> 0.39,  face_count=3 -> 0.73,  face_count=6 -> 1.0
 
 
--------------------------------------------------------------------------------
-4.4  DEDUPLICATION LOGIC
--------------------------------------------------------------------------------
 
-  The algorithm is O(N^2) in the worst case but fast in practice because
-  pHash comparison (step 2) short-circuits before CLIP comparison (step 3).
+### 4.4  DEDUPLICATION LOGIC
+
+
+  ANN-accelerated path (default, when ChromaDB store has data):
 
   Input photos sorted by blur_score DESC:
   [sharp.jpg, medium.jpg, blurry.jpg, duplicate_of_sharp.jpg, ...]
@@ -825,13 +914,22 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   for each candidate in sorted list:
     if candidate.path in to_remove: skip
 
-    for each keeper in accepted list:
-      if candidate.file_hash == keeper.file_hash:     -> duplicate
-      if hamming(candidate.phash, keeper.phash) <= 8: -> duplicate
-      if cosine(candidate.clip_emb, keeper.clip_emb) >= 0.95: -> duplicate
+    1. file_hash dict lookup         O(1)   -> exact duplicate?
+    2. store.search_clip(emb, K=30)  O(log N) -> K nearest neighbours
+       filter to accepted_paths only, check cosine_sim >= 0.95
+    3. phash_index scan              O(N_accepted), fast int XOR
 
-    if no match found: add to accepted list
-    else: add to to_remove set
+    if no match: add to accepted_paths + phash_index
+    else: add to to_remove
+
+  Complexity: O(N · K) vs O(N²) for the CLIP step.
+  50 000 photos: 1.5 M comparisons instead of 1.25 B.
+
+  Fallback (brute-force, used if store is empty):
+    for each keeper in accepted list:
+      if candidate.file_hash == keeper.file_hash:           -> dup
+      if hamming(candidate.phash, keeper.phash) <= 8:       -> dup
+      if cosine(candidate.clip_emb, keeper.clip_emb) >= 0.95: -> dup
 
   Result: to_remove contains paths of all weaker copies.
   The kept copy is always the sharpest (highest blur_score).
@@ -848,9 +946,9 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
       0.80 = related scenes
 
 
--------------------------------------------------------------------------------
-4.5  EVENT CLUSTERING ALGORITHM
--------------------------------------------------------------------------------
+
+### 4.5  EVENT CLUSTERING ALGORITHM
+
 
   Goal: group photos from the same occasion (trip, party, hike) together.
 
@@ -882,9 +980,9 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     they just don't benefit from the diversity_bonus weight.
 
 
--------------------------------------------------------------------------------
-4.6  FACE IDENTITY CLUSTERING
--------------------------------------------------------------------------------
+
+### 4.6  FACE IDENTITY CLUSTERING
+
 
   Goal: identify "Person A" across hundreds of photos without any labelling.
 
@@ -915,12 +1013,14 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     in the final output.
 
 
--------------------------------------------------------------------------------
-4.7  PRIVACY FILTER CHAIN
--------------------------------------------------------------------------------
+
+### 4.7  PRIVACY FILTER CHAIN
+
 
   Three checks, ordered cheapest-first:
 
+
+```text
   Check 1: Screenshot heuristic (< 1ms, no ML)
   +------------------------------------------+
   | has_gps == True       -> NOT screenshot   |
@@ -933,6 +1033,10 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   resolutions in both portrait and landscape orientations.
 
   Check 2: Home + solo heuristic (< 1ms, no ML)
+```
+
+
+```text
   +------------------------------------------+
   | Only active if filter_home_private: true   |
   | haversine(photo_gps, home_coords)          |
@@ -940,8 +1044,12 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   | AND face_count <= 1                        |
   | -> IS private                              |
   +------------------------------------------+
+```
+
 
   Check 3: CLIP document detection (~5-10ms, ML)
+
+```text
   +------------------------------------------+
   | Encodes 7 text prompts (6 private + 1     |
   | normal) through CLIP text encoder once.   |
@@ -949,6 +1057,8 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   | Sum of private prompt probabilities        |
   |   > 0.35 threshold -> IS document/private |
   +------------------------------------------+
+```
+
 
   Private prompts:
     "a photo of a document or paper"
@@ -962,9 +1072,9 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     "a natural photo taken with a camera outdoors or indoors"
 
 
--------------------------------------------------------------------------------
-4.8  OUTPUT RESIZING
--------------------------------------------------------------------------------
+
+### 4.8  OUTPUT RESIZING
+
 
   Why resize?
     A 12 MP photo at full resolution is ~3.5-5 MB as JPEG.
@@ -996,13 +1106,65 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     This is an approximation — actual JPEG size varies by content.
 
 
-===============================================================================
+
+### 4.9  VECTOR STORE
+
+
+  ChromaDB is used as a local, server-free HNSW vector database.
+  No Docker, no daemon — it persists as a directory on disk.
+
+  Two collections:
+
+```text
+  Collection          Distance   Dimension   Used by
+  ------------------  ---------  ----------  -----------------------------------
+  clip_embeddings     cosine     512         Stage 6 dedup ANN search
+                                             Stage 7 event clustering bulk fetch
+  face_embeddings     L2         512         Stage 8 face identity bulk fetch
+```
+
+
+  Startup sync (_sync_store_from_sqlite):
+    On the first run after upgrading to ChromaDB, existing SQLite BLOBs
+    are migrated to the vector store automatically. This is a one-time
+    operation — subsequent runs are instant no-ops because ChromaDB persists
+    to disk and IDs are checked before re-inserting.
+
+  Distance conventions:
+    cosine distance = 1 − cosine_similarity  (for normalised vectors)
+    For CLIP (already L2-normalised): dist=0 identical, dist=2 opposite.
+    In find_duplicates_ann: similarity = max(0, 1 − dist) >= 0.95 is a dup.
+
+  Scaling:
+    ChromaDB uses hnswlib under the hood. HNSW is O(log N) for insert and
+    search. The index is rebuilt incrementally — no full rebuild on upsert.
+
+    Tested scale       Dedup time   Cluster time
+    ---------------    ----------   ------------
+    5 000 photos       ~5 sec       ~15 sec
+    50 000 photos      ~45 sec      ~2 min
+    500 000 photos     ~8 min       ~20 min (estimated)
+
+
+  Store layout:
+    cache/vector_store/
+      chroma.sqlite3          ChromaDB internal metadata
+      <uuid>/                 HNSW index files per collection
+        data_level0.bin
+        header.bin
+        length.bin
+        link_lists.bin
+
+
+
 ## 5. MODULE DEPENDENCY GRAPH
-===============================================================================
 
-  Arrows show "imports / calls". database.py is used by everything
-  (omitted from arrows for clarity).
 
+  Arrows show "imports / calls". database.py and vector_store.py are used
+  by multiple stages (shown at the bottom).
+
+
+```text
                          config.yaml
                               |
                          main.py  <-- you run this
@@ -1016,14 +1178,14 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
                               |        |        |     |
                               v        v        v     v
                           aesthetic  scene  privacy  face_clustering
-                          (reads DB) tagger (CLIP)
+                          (reads DB) tagger (CLIP)  (reads VS)
                                       (reads DB)
                                            |
                               +------------+------------+
                               |            |            |
                               v            v            v
                         deduplication  clustering   sentiment
-                        (pHash+CLIP)   (DBSCAN)   (MediaPipe)
+                        (ANN via VS)  (DBSCAN+VS)  (MediaPipe)
                               |            |            |
                               +------------+------------+
                                            |
@@ -1033,6 +1195,9 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
                                            |
                                       output/
 
+  VS = vector_store.py (ChromaDB)
+```
+
 
   Shared model singletons (loaded once per process):
     CLIP model     : embeddings.py -> also used by aesthetic.py,
@@ -1040,10 +1205,14 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     MTCNN+FaceNet  : face_detection.py
     MediaPipe      : sentiment.py
 
+  Persistence layers:
+    database.py      -> cache/photo_db.sqlite    (metadata, scores, flags)
+    vector_store.py  -> cache/vector_store/      (CLIP + face embeddings)
 
-===============================================================================
+
+
 ## 6. CONFIGURATION REFERENCE
-===============================================================================
+
 
   All settings live in config.yaml. Run python main.py --config my.yaml
   to use a different file.
@@ -1053,6 +1222,13 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     output                Path where curated photos are written
     cache                 SQLite database path
     models                Directory for downloaded model weights
+
+  vector_store:
+    path                  Directory for ChromaDB HNSW index files
+                          Default: cache/vector_store
+                          Safe to delete — rebuilt from SQLite BLOBs on next run
+    clip_collection       ChromaDB collection name for CLIP embeddings
+    face_collection       ChromaDB collection name for face embeddings
 
   ingestion:
     supported_extensions  List of file extensions to include
@@ -1129,10 +1305,10 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     report_filename       Name of the JSON report file
 
 
-===============================================================================
-## 7. FILE & DIRECTORY LAYOUT
-===============================================================================
 
+## 7. FILE & DIRECTORY LAYOUT
+
+```text
   photo-curator/
   |
   +-- main.py                   Pipeline orchestrator. Run this.
@@ -1150,8 +1326,10 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   |       +-- output.json       Curation report (score, faces, GPS, etc.)
   |
   +-- cache/
-  |   +-- photo_db.sqlite       SQLite feature cache.
-  |                             Safe to delete — will be rebuilt on next run.
+  |   +-- photo_db.sqlite       SQLite metadata cache.
+  |   |                         Safe to delete — rebuilt on next run.
+  |   +-- vector_store/         ChromaDB HNSW index (CLIP + face embeddings).
+  |                             Safe to delete — synced from SQLite on next run.
   |
   +-- models/
   |   +-- aesthetic_predictor.pth   (downloaded on demand if LAION enabled)
@@ -1167,56 +1345,74 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
       +-- aesthetic.py          CLIP zero-shot aesthetic scoring
       +-- scene_tagger.py       Zero-shot scene classification (28 labels)
       +-- sentiment.py          MediaPipe smile + eye openness
-      +-- deduplication.py      pHash Hamming + cosine similarity
+      +-- deduplication.py      pHash Hamming + ANN cosine (brute-force fallback)
       +-- clustering.py         DBSCAN event grouping (time+GPS+CLIP)
       +-- privacy.py            Screenshot + document + home filter
       +-- ranking.py            7-component weighted score
       +-- selection.py          30/30/40 diversity + JPEG resize output
-      +-- database.py           SQLite cache layer (upsert + migration)
+      +-- database.py           SQLite metadata layer (upsert + migration)
+      +-- vector_store.py       ChromaDB HNSW wrapper (CLIP + face embeddings)
+```
 
 
-===============================================================================
+
 ## 8. PERFORMANCE & SCALING
-===============================================================================
+
 
   STAGE TIMING BREAKDOWN (Apple M1, 5 000 photos)
 
+
+```text
   Stage   Operation                    Time       Notes
   ------  ---------------------------  ---------  ----------------------------
+  0       Vector store init / sync     ~1 sec     No-op after first run
   1       Scan + hash                  ~30 sec    Disk I/O bound
   2       EXIF + quality + CLIP        ~25 min    CLIP is the bottleneck
           + face detection             (~0.3s/img on MPS)
-  3       Aesthetic scoring            ~10 sec    Reads from DB, no re-run
-  4       Scene tagging                ~10 sec    Reads from DB, no re-run
+          + ChromaDB upsert            (~0ms/img, non-blocking)
+  3       Aesthetic scoring            ~10 sec    Reads from DB, no re-inference
+  4       Scene tagging                ~10 sec    Reads from DB, no re-inference
   5       Sentiment (MediaPipe)        ~8 min     Only on face photos
-  6       Deduplication                ~20 sec    O(N^2) pHash fast path
-  7       Event clustering             ~15 sec    PCA + DBSCAN
-  8       Face identity clustering     ~5 sec     DBSCAN on embeddings
+  6       Deduplication (ANN)          ~5 sec     O(N·K) via ChromaDB
+  7       Event clustering             ~15 sec    PCA + DBSCAN on VS embeddings
+  8       Face identity clustering     ~5 sec     DBSCAN on VS embeddings
   9       Ranking + selection          ~5 sec     Pure numpy math
           File copy + resize           ~10 min    Disk I/O + PIL resize
   ------  ---------------------------  ---------  ----------------------------
   TOTAL                                ~60 min    First run (all ML)
   RE-RUN (no new photos)               ~15 sec    Only stages 3-9 from DB
+```
+
 
   LIBRARY SIZE ESTIMATES (Apple M1)
 
-  Photos     Stage 2 time     Total first run
-  ---------  ---------------  ---------------
-  1 000      ~5 min           ~15 min
-  5 000      ~25 min          ~60 min
-  10 000     ~50 min          ~2 hours
-  20 000     ~100 min         ~4 hours
+
+```text
+  Photos     Stage 2 time     Dedup time   Total first run
+  ---------  ---------------  -----------  ---------------
+  1 000      ~5 min           <1 sec       ~15 min
+  5 000      ~25 min          ~5 sec       ~60 min
+  10 000     ~50 min          ~10 sec      ~2 hours
+  50 000     ~4 hours         ~45 sec      ~10 hours
+  500 000+   scales linearly  ~8 min       days (Stage 2)
+```
+
 
   MEMORY USAGE
 
-  Component                Approximate memory
-  -----------------------  ------------------
-  CLIP model (ViT-B/32)    ~350 MB
-  MTCNN + FaceNet          ~250 MB
-  MediaPipe                ~100 MB
-  SQLite cache (5k photos) ~20 MB (on disk)
-  Per-image working set    ~5-20 MB peak
-  Total peak               ~800 MB - 1.2 GB
+
+```text
+  Component                  Approximate memory
+  -------------------------  ------------------
+  CLIP model (ViT-B/32)      ~350 MB
+  MTCNN + FaceNet            ~250 MB
+  MediaPipe                  ~100 MB
+  ChromaDB HNSW index        ~50 MB per 50k photos (mapped, not loaded)
+  SQLite cache (5k photos)   ~20 MB (on disk)
+  Per-image working set      ~5-20 MB peak
+  Total peak                 ~800 MB - 1.2 GB
+```
+
 
   SPEED-UP TIPS
 
@@ -1226,16 +1422,19 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   3. Disable sentiment (sentiment.enabled: false) if you have few
      face photos — saves ~30% of total time.
   4. Use --from-stage to re-run only later stages after config changes.
-  5. The SQLite cache is the biggest win for repeated runs. Never delete
-     photo_db.sqlite unless you want to reprocess everything.
+  5. The SQLite cache and the vector store together give the biggest win
+     for repeated runs. Never delete photo_db.sqlite or cache/vector_store/
+     unless you want to reprocess everything from scratch.
 
 
-===============================================================================
+
 ## 9. USAGE
-===============================================================================
+
 
   BASIC
 
+
+```bash
     cd photo-curator
     python main.py
 
@@ -1275,3 +1474,5 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     pip install git+https://github.com/openai/CLIP.git   # required
     # pip install mediapipe                              # for sentiment
     # pip install huggingface_hub                       # for LAION aesthetic
+```
+
