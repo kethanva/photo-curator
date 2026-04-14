@@ -308,6 +308,8 @@ def stage_dedup(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
         )
 
     with database.connect(db_path) as conn:
+        # Reset all before applying new flags to make stage idempotent
+        conn.execute("UPDATE photos SET is_duplicate=0 WHERE quality_pass=1 AND is_private=0")
         for p in dup_paths:
             database.update_fields(conn, p, is_duplicate=1)
         conn.commit()

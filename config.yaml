@@ -27,8 +27,8 @@ quality:
   min_resolution: 640       # shorter side in pixels
 
 deduplication:
-  phash_threshold: 8        # Hamming distance (0 = exact, 8 = very similar)
-  embedding_similarity: 0.95  # cosine similarity floor for visual duplicates
+  phash_threshold: 16        # Hamming distance (0 = exact, 16 = similar framing)
+  embedding_similarity: 0.80  # cosine similarity floor (0.80 = same subject, different angle)
 
 privacy:
   filter_screenshots: true
