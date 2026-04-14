@@ -32,26 +32,45 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
 - [7. FILE & DIRECTORY LAYOUT](#7-file-directory-layout)
 - [8. PERFORMANCE & SCALING](#8-performance-scaling)
 - [9. USAGE](#9-usage)
+- [10. TESTING](#10-testing)
 
 ## 1. QUICK START
 
-
+**Recommended — one-command setup and run:**
 
 ```bash
-    git clone <repo> photo-curator && cd photo-curator
-    python3 -m venv .venv && source .venv/bin/activate
-    pip install -r requirements.txt
-    pip install git+https://github.com/openai/CLIP.git
+git clone <repo> photo-curator && cd photo-curator
 
-    # drop your photos in
-    cp -r /path/to/photos data/input_photos/
+# Drop your photos in
+cp -r /path/to/photos data/input_photos/
 
-    # run the full pipeline
-    python main.py
+# run.sh handles everything: finds Python 3.10+, creates .venv,
+# installs all dependencies, installs CLIP, then runs the pipeline.
+./run.sh
+```
 
-    # output + report
-    data/output_photos/
-    data/output_photos/output.json
+Output is written to `data/output_photos/` + `data/output_photos/output.json`.
+
+**Manual setup (if you prefer full control):**
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pip install git+https://github.com/openai/CLIP.git   # required; not on PyPI
+cp -r /path/to/photos data/input_photos/
+python main.py
+```
+
+**Useful helpers:**
+
+```bash
+./run.sh --dry-run           # score photos, skip file copy
+./run.sh --from-stage 9      # re-rank + re-select only (seconds)
+./run.sh --check-only        # verify environment without running
+
+./cleanup.sh --cache         # wipe SQLite DB + vector store (force reprocess)
+./cleanup.sh --output        # delete curated output photos
+./cleanup.sh --all           # clean everything (dry-run first: --dry-run)
 ```
 
 
@@ -306,9 +325,9 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   |  - Sorts by blur_score DESC (sharpest copy kept)            |
   |  - For each photo, checks against already-accepted set:      |
   |      Pass 1: exact MD5 match?         -> duplicate           |
-  |      Pass 2: ANN search top-30 CLIP   -> cosine sim >= 0.95 |
+  |      Pass 2: ANN search top-100 CLIP  -> cosine sim >= 0.80 |
   |              (O(N·K) via ChromaDB, not O(N²) brute force)   |
-  |      Pass 3: pHash Hamming dist <= 8? -> duplicate          |
+  |      Pass 3: pHash Hamming dist <= 16?-> duplicate          |
   |  - Marks losers: UPDATE photos SET is_duplicate=1           |
   +---+----------------------------------------------------------+
       |
@@ -560,7 +579,7 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   resolution(img) -> int
     min(width, height). Conservative measure.
 
-  assess(img, min_blur, min_exposure, max_exposure, min_resolution)
+  assess(img, min_blur_score, min_exposure_score, max_exposure_score, min_resolution)
     -> QualityResult(blur_score, exposure_score, resolution, passes)
 
   ----------------------------------------
@@ -665,7 +684,7 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     Returns Set[path] of photos to mark as duplicates.
 
   find_duplicates_ann(records, store, phash_threshold,
-                      embedding_threshold, ann_k=30) -> Set[str]
+                      embedding_threshold, ann_k=100) -> Set[str]
     ANN-accelerated version. O(N·K) instead of O(N²).
     For each candidate, queries the VectorStore for its K nearest
     CLIP neighbours and checks only those that are already accepted.
@@ -914,36 +933,39 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   for each candidate in sorted list:
     if candidate.path in to_remove: skip
 
-    1. file_hash dict lookup         O(1)   -> exact duplicate?
-    2. store.search_clip(emb, K=30)  O(log N) -> K nearest neighbours
-       filter to accepted_paths only, check cosine_sim >= 0.95
-    3. phash_index scan              O(N_accepted), fast int XOR
+    1. file_hash dict lookup          O(1)     -> exact duplicate?
+    2. store.search_clip(emb, K=100)  O(log N) -> K nearest neighbours
+       filter to accepted_paths only, check cosine_sim >= 0.80
+    3. phash_index scan               O(N_accepted), fast int XOR
+       hamming_distance <= 16         -> duplicate
 
     if no match: add to accepted_paths + phash_index
     else: add to to_remove
 
   Complexity: O(N · K) vs O(N²) for the CLIP step.
-  50 000 photos: 1.5 M comparisons instead of 1.25 B.
+  50 000 photos: 5 M comparisons instead of 1.25 B — still 250x faster.
 
   Fallback (brute-force, used if store is empty):
     for each keeper in accepted list:
-      if candidate.file_hash == keeper.file_hash:           -> dup
-      if hamming(candidate.phash, keeper.phash) <= 8:       -> dup
-      if cosine(candidate.clip_emb, keeper.clip_emb) >= 0.95: -> dup
+      if candidate.file_hash == keeper.file_hash:            -> dup
+      if hamming(candidate.phash, keeper.phash) <= 16:       -> dup
+      if cosine(candidate.clip_emb, keeper.clip_emb) >= 0.80: -> dup
 
   Result: to_remove contains paths of all weaker copies.
   The kept copy is always the sharpest (highest blur_score).
 
   Threshold meanings:
-    pHash Hamming distance:
-      0 = exact visual duplicate (different compression)
-      8 = very similar (burst shots, slight crop)
-      16 = visually related but distinct
+    pHash Hamming distance (default 16):
+      0  = exact visual duplicate (different compression only)
+      8  = burst shots, very slight crop
+      16 = same framing with different angle or minor difference
+      24 = visually related but distinct compositions
 
-    CLIP cosine similarity:
+    CLIP cosine similarity (default 0.80):
       0.95 = nearly identical content
       0.90 = same scene, slightly different framing
-      0.80 = related scenes
+      0.80 = same subject / event, different angle (current default)
+      0.70 = visually related scenes
 
 
 
@@ -1244,8 +1266,8 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
     min_resolution        Minimum shorter side in pixels. 640 = standard.
 
   deduplication:
-    phash_threshold       Hamming distance. 8 = burst shots. 4 = strict.
-    embedding_similarity  Cosine threshold. 0.95 = near-identical.
+    phash_threshold       Hamming distance. 16 = same framing. 8 = burst shots. 4 = strict.
+    embedding_similarity  Cosine threshold. 0.80 = same subject. 0.95 = near-identical.
 
   privacy:
     filter_screenshots    Remove screenshots (heuristic + resolution check)
@@ -1311,9 +1333,11 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
 ```text
   photo-curator/
   |
-  +-- main.py                   Pipeline orchestrator. Run this.
+  +-- main.py                   Pipeline orchestrator. Run this directly or via run.sh.
   +-- config.yaml               All tunable parameters.
-  +-- requirements.txt          Python dependencies.
+  +-- requirements.txt          Python dependencies (pinned for compatibility).
+  +-- run.sh                    One-command setup + launcher. Handles venv, deps, CLIP install.
+  +-- cleanup.sh                Maintenance utility. Clears cache, output, models, venv.
   |
   +-- data/
   |   +-- input_photos/         [ PUT YOUR PHOTOS HERE ]
@@ -1321,37 +1345,56 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
   |   |   +-- holidays/
   |   |   +-- ...
   |   +-- output_photos/        [ CURATED OUTPUT WRITTEN HERE ]
-  |       +-- IMG_1234.jpg      Resized JPEG (2560px long side)
+  |       +-- IMG_1234.jpg      Resized JPEG (2560px long side, JPEG q92)
   |       +-- ...
-  |       +-- output.json       Curation report (score, faces, GPS, etc.)
+  |       +-- output.json       Curation report (score, faces, GPS, scene tags, etc.)
   |
-  +-- cache/
-  |   +-- photo_db.sqlite       SQLite metadata cache.
-  |   |                         Safe to delete — rebuilt on next run.
+  +-- cache/                    (gitignored — rebuilt automatically on next run)
+  |   +-- photo_db.sqlite       SQLite metadata cache (scores, flags, EXIF per photo).
   |   +-- vector_store/         ChromaDB HNSW index (CLIP + face embeddings).
-  |                             Safe to delete — synced from SQLite on next run.
   |
-  +-- models/
-  |   +-- aesthetic_predictor.pth   (downloaded on demand if LAION enabled)
+  +-- models/                   (gitignored — downloaded on demand)
+  |   +-- aesthetic_predictor.pth   Only present if aesthetic.use_laion_predictor: true
   |
   +-- src/
-      +-- __init__.py
-      +-- ingestion.py          Scan + hash + load images
-      +-- metadata.py           EXIF extraction (timestamp, GPS, camera)
-      +-- quality.py            Blur + exposure + resolution metrics
-      +-- embeddings.py         CLIP ViT-B/32 (MPS / CUDA / CPU)
-      +-- face_detection.py     MTCNN detector + FaceNet embedder
-      +-- face_clustering.py    Cross-photo person identity via DBSCAN
-      +-- aesthetic.py          CLIP zero-shot aesthetic scoring
-      +-- scene_tagger.py       Zero-shot scene classification (28 labels)
-      +-- sentiment.py          MediaPipe smile + eye openness
-      +-- deduplication.py      pHash Hamming + ANN cosine (brute-force fallback)
-      +-- clustering.py         DBSCAN event grouping (time+GPS+CLIP)
-      +-- privacy.py            Screenshot + document + home filter
-      +-- ranking.py            7-component weighted score
-      +-- selection.py          30/30/40 diversity + JPEG resize output
-      +-- database.py           SQLite metadata layer (upsert + migration)
-      +-- vector_store.py       ChromaDB HNSW wrapper (CLIP + face embeddings)
+  |   +-- __init__.py
+  |   +-- ingestion.py          Scan + hash + load images
+  |   +-- metadata.py           EXIF extraction (timestamp, GPS, camera)
+  |   +-- quality.py            Blur + exposure + resolution metrics
+  |   +-- embeddings.py         CLIP ViT-B/32 (MPS / CUDA / CPU)
+  |   +-- face_detection.py     MTCNN detector + FaceNet embedder
+  |   +-- face_clustering.py    Cross-photo person identity via DBSCAN
+  |   +-- aesthetic.py          CLIP zero-shot aesthetic scoring
+  |   +-- scene_tagger.py       Zero-shot scene classification (28 labels)
+  |   +-- sentiment.py          MediaPipe smile + eye openness
+  |   +-- deduplication.py      pHash Hamming + ANN cosine (brute-force fallback)
+  |   +-- clustering.py         DBSCAN event grouping (time+GPS+CLIP)
+  |   +-- privacy.py            Screenshot + document + home filter
+  |   +-- ranking.py            7-component weighted score
+  |   +-- selection.py          30/30/40 diversity + JPEG resize output
+  |   +-- database.py           SQLite metadata layer (upsert + migration)
+  |   +-- vector_store.py       ChromaDB HNSW wrapper (CLIP + face embeddings)
+  |
+  +-- tests/                    282 unit + integration tests (pytest)
+      +-- conftest.py
+      +-- test_database.py
+      +-- test_ingestion.py
+      +-- test_quality.py
+      +-- test_deduplication.py
+      +-- test_deduplication_ann.py
+      +-- test_embeddings.py
+      +-- test_face_detection.py
+      +-- test_face_clustering.py
+      +-- test_aesthetic.py
+      +-- test_scene_tagger.py
+      +-- test_sentiment.py
+      +-- test_clustering.py
+      +-- test_ranking.py
+      +-- test_selection.py
+      +-- test_selection_output.py
+      +-- test_privacy.py
+      +-- test_metadata.py
+      +-- test_vector_store.py
 ```
 
 
@@ -1431,48 +1474,127 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
 ## 9. USAGE
 
 
-  BASIC
-
+  RECOMMENDED — run.sh (handles venv, deps, CLIP, then launches the pipeline)
 
 ```bash
-    cd photo-curator
+    ./run.sh                              # full pipeline, defaults from config.yaml
+    ./run.sh --input /Volumes/Photos      # custom input folder
+    ./run.sh --output ~/Desktop/Best      # custom output folder
+    ./run.sh --dry-run                    # score + select, no files written
+    ./run.sh --from-stage 6              # re-dedup + cluster + rank + select
+    ./run.sh --from-stage 9              # re-rank and re-select only (seconds)
+    ./run.sh --config configs/strict.yaml # use alternate config file
+    ./run.sh --no-clean                  # skip cache wipe (keep existing cache)
+    ./run.sh --check-only                # verify environment, don't run pipeline
+    ./run.sh --reinstall                 # force reinstall all dependencies
+```
+
+  DIRECT INVOCATION (after venv is active)
+
+```bash
     python main.py
-
-  CUSTOM PATHS
-
     python main.py --input /Volumes/Photos --output ~/Desktop/Best
-
-  DRY RUN (score + select, no files written)
-
     python main.py --dry-run
-
-  RESUME FROM STAGE (uses existing DB cache)
-
-    python main.py --from-stage 6    # re-dedup + cluster + rank + select
-    python main.py --from-stage 9    # just re-rank and re-select
-
-  CUSTOM CONFIG
-
+    python main.py --from-stage 9
     python main.py --config configs/strict.yaml
+```
+
+  CACHE MANAGEMENT — cleanup.sh
+
+```bash
+    ./cleanup.sh --cache         # delete SQLite DB + vector store (forces full reprocess)
+    ./cleanup.sh --output        # delete curated output photos + report
+    ./cleanup.sh --models        # delete downloaded ML model weights
+    ./cleanup.sh --venv          # delete .venv (reinstalled by run.sh)
+    ./cleanup.sh --pycache       # delete __pycache__ / .pyc bytecode
+    ./cleanup.sh --all           # delete everything above
+    ./cleanup.sh --dry-run       # preview what would be deleted, don't delete
+    # flags can be combined: ./cleanup.sh --cache --output --dry-run
+```
+
+  TESTING
+
+```bash
+    # Install pytest into the project venv first (if not present)
+    .venv/bin/pip install pytest pytest-cov
+
+    # Run all 282 tests
+    .venv/bin/pytest tests/ -q
+
+    # Run with coverage report
+    .venv/bin/pytest tests/ --cov=src --cov-report=term-missing
+```
 
   TYPICAL TUNING WORKFLOW
 
-    1. Run full pipeline once: python main.py
+    1. Run full pipeline:  ./run.sh
     2. Review output.json — check scores, scene tags, person IDs
     3. Edit config.yaml (adjust weights, thresholds, budget)
-    4. Re-run from stage 9: python main.py --from-stage 9  (seconds)
+    4. Re-run from stage 9:  ./run.sh --no-clean --from-stage 9  (seconds)
     5. Iterate until satisfied
 
   REQUIREMENTS
 
-    Python 3.10+
+    Python 3.10+ (run.sh auto-detects; prefers 3.12)
     macOS with Apple Silicon (MPS), or NVIDIA GPU (CUDA), or CPU fallback
     4 GB RAM minimum, 8 GB recommended
-    Disk space: ~100 MB models + cache size (~4 KB per photo in DB)
+    Disk space: ~2 GB for .venv + ~100 MB models + ~4 KB per photo in DB
 
-    pip install -r requirements.txt
-    pip install git+https://github.com/openai/CLIP.git   # required
-    # pip install mediapipe                              # for sentiment
-    # pip install huggingface_hub                       # for LAION aesthetic
+    Key pinned constraints (see requirements.txt):
+      numpy < 2.0          — required by facenet-pytorch + mediapipe
+      Pillow < 10.3        — required by facenet-pytorch + mediapipe
+      CLIP                 — installed from GitHub (not on PyPI)
+
+    Optional:
+      pip install mediapipe      # enables smile + eye scoring (Stage 5)
+      pip install huggingface_hub # enables LAION aesthetic predictor
+
+
+
+## 10. TESTING
+
+
+  The test suite covers all 16 src/ modules with 282 tests.
+  Tests use synthetic images and mocked ML models — no real photos or
+  GPU required. Full suite runs in ~6 seconds.
+
+```bash
+  # Install pytest (once)
+  .venv/bin/pip install pytest pytest-cov
+
+  # Run all tests
+  .venv/bin/pytest tests/ -q
+
+  # Run with coverage
+  .venv/bin/pytest tests/ --cov=src --cov-report=term-missing
+
+  # Run a single module's tests
+  .venv/bin/pytest tests/test_quality.py -v
+  .venv/bin/pytest tests/test_deduplication.py -v
 ```
 
+
+  TEST COVERAGE BY MODULE
+
+```text
+  Test file                  Module tested          Key scenarios
+  -------------------------  ---------------------  ------------------------------------------
+  test_database.py           database.py            upsert, get_all, migration, WAL mode
+  test_ingestion.py          ingestion.py           scan, hash, load, HEIC, corrupt files
+  test_quality.py            quality.py             blur/exposure/resolution, edge cases
+  test_deduplication.py      deduplication.py       pHash, hamming, brute-force dedup
+  test_deduplication_ann.py  deduplication.py       ANN path, K=100, idempotency
+  test_embeddings.py         embeddings.py          CLIP extract, batch, cosine sim
+  test_face_detection.py     face_detection.py      MTCNN detect, FaceNet embed, score
+  test_face_clustering.py    face_clustering.py     DBSCAN identity, frequent flag
+  test_aesthetic.py          aesthetic.py           CLIP zero-shot, LAION path
+  test_scene_tagger.py       scene_tagger.py        28-label classify, JSON serialise
+  test_sentiment.py          sentiment.py           EAR, smile, no-face fallback
+  test_clustering.py         clustering.py          feature matrix, DBSCAN, noise
+  test_ranking.py            ranking.py             7-component score, minmax
+  test_selection.py          selection.py           30/30/40 buckets, caps, budget
+  test_selection_output.py   selection.py           copy_to_output, resize, clean dir
+  test_privacy.py            privacy.py             screenshot, doc CLIP, home filter
+  test_metadata.py           metadata.py            EXIF parse, GPS decode
+  test_vector_store.py       vector_store.py        ChromaDB upsert, ANN search, sync
+```
