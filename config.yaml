@@ -66,7 +66,48 @@ face_clustering:
   min_samples: 2
   frequent_person_threshold: 5 # min photos to be classified as "frequent person"
 
-# ── Ranking weights (must sum to ~1.0) ──────────────────────────────────────
+# ── Subject Priority ─────────────────────────────────────────────────────────
+# Photos matching these subjects receive a score boost during ranking,
+# making them more likely to be selected in the output.
+#
+# Built-in preset names (use as-is without specifying prompts):
+#   human, landscape, nature, bike, food, travel, pets, sports,
+#   celebration, architecture, cars, night, street, fashion
+#
+# Priority tiers:
+#   high   → 1.0 boost multiplier
+#   medium → 0.6 boost multiplier
+#   low    → 0.3 boost multiplier
+#
+# Custom subjects: specify prompts to override or extend any preset.
+# Re-running from --from-stage 9 picks up subject changes instantly.
+subject_priority:
+  enabled: true
+  subjects:
+    - name: human
+      priority: high
+    - name: landscape
+      priority: high
+    - name: nature
+      priority: medium
+    # Uncomment or add subjects as needed:
+    # - name: pets
+    #   priority: medium
+    # - name: travel
+    #   priority: medium
+    # - name: celebration
+    #   priority: high
+    # Custom subject with your own CLIP prompts:
+    # - name: bike
+    #   priority: medium
+    #   prompts:
+    #     - "cycling or bicycle on a trail"
+    #     - "mountain biking adventure"
+    #     - "road cyclist in motion"
+
+# ── Ranking weights ──────────────────────────────────────────────────────────
+# Base weights (sharpness … diversity_bonus) do not need to sum to 1.0.
+# subject_boost is additive on top; set to 0.0 to disable.
 ranking:
   weights:
     sharpness:           0.15
@@ -76,10 +117,17 @@ ranking:
     uniqueness:          0.15
     metadata_importance: 0.08
     diversity_bonus:     0.07
+    subject_boost:       0.20   # additive boost for subject-priority photos
 
-# ── Selection — 30 / 30 / 40 diversity strategy ─────────────────────────────
+# ── Selection — output budget + 30 / 30 / 40 diversity strategy ─────────────
 selection:
-  max_output_bytes: 1_073_741_824   # 1 GB
+  # Output budget mode — choose one:
+  #   percentage  → select output_percentage of all eligible photos
+  #   bytes       → fill up to max_output_bytes (1 GB default)
+  # Both modes still apply the byte cap as a hard upper limit.
+  output_mode: percentage       # 'percentage' or 'bytes'
+  output_percentage: 0.15       # 15 % of eligible photos (output_mode=percentage)
+  max_output_bytes: 1_073_741_824   # 1 GB hard cap (always enforced)
 
   # Bucket fractions (must sum to 1.0)
   people_budget_fraction:    0.30  # top photos per frequent person
@@ -91,7 +139,7 @@ selection:
   max_per_location: 15   # max photos from any single location cluster
   max_per_cluster:  10   # event-cluster cap (backup diversity guard)
 
-  # Output resizing — dramatically increases photos that fit in 1 GB
+  # Output resizing — dramatically increases photos that fit in budget
   resize_output:       true
   output_long_side:    2560   # pixels — good for 2K/4K displays
   output_jpeg_quality: 92     # 85–95 recommended
