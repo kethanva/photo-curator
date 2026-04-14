@@ -25,6 +25,10 @@ ImageHash>=4.3.1
 scikit-learn>=1.3.0
 numpy>=1.24.0
 
+# Vector store — local HNSW-backed ANN search (no server required)
+# Replaces SQLite BLOB + in-memory DBSCAN for large libraries (50k+ photos)
+chromadb>=0.4.22
+
 # Progress display
 tqdm>=4.66.0
 

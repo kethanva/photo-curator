@@ -30,6 +30,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+import numpy as np
 import yaml
 from tqdm import tqdm
 
@@ -49,6 +50,7 @@ from src import (
     scene_tagger,
     selection,
     sentiment,
+    vector_store as vs,
 )
 
 
@@ -66,11 +68,64 @@ def _home_coords(cfg: dict):
     return tuple(home) if home else None
 
 
+def _init_vector_store(cfg: dict) -> "vs.VectorStore":
+    """Create or open the persistent ChromaDB vector store."""
+    vs_cfg = cfg.get("vector_store", {})
+    store_path = vs_cfg.get("path", "cache/vector_store")
+    clip_col   = vs_cfg.get("clip_collection", "clip_embeddings")
+    face_col   = vs_cfg.get("face_collection", "face_embeddings")
+    return vs.VectorStore(store_path, clip_col, face_col)
+
+
+def _sync_store_from_sqlite(db_path: str, store: "vs.VectorStore") -> int:
+    """
+    Migrate any CLIP / face BLOBs that are in SQLite but not yet in the
+    vector store.  Runs once at pipeline start — subsequent runs are no-ops
+    because ChromaDB persists to disk.
+
+    Returns the number of CLIP embeddings synced.
+    """
+    existing_clip = store.clip_ids()
+    existing_face = store.face_ids()
+
+    with database.connect(db_path) as conn:
+        rows = database.get_all(conn, "clip_emb IS NOT NULL")
+
+    clip_paths, clip_embs = [], []
+    face_paths, face_embs = [], []
+
+    for row in rows:
+        path = row["path"]
+        if path not in existing_clip:
+            emb = database.blob_to_emb(row["clip_emb"])
+            if emb is not None:
+                clip_paths.append(path)
+                clip_embs.append(emb)
+
+        if row["face_emb"] and path not in existing_face:
+            femb = database.blob_to_emb(row["face_emb"])
+            if femb is not None:
+                face_paths.append(path)
+                face_embs.append(femb)
+
+    if clip_paths:
+        store.upsert_clip_batch(clip_paths, np.vstack(clip_embs))
+    if face_paths:
+        store.upsert_face_batch(face_paths, np.vstack(face_embs))
+
+    if clip_paths or face_paths:
+        print(
+            f"  Synced {len(clip_paths)} CLIP + {len(face_paths)} face "
+            "embeddings from SQLite → vector store"
+        )
+    return len(clip_paths)
+
+
 # ---------------------------------------------------------------------------
 # Stage functions
 # ---------------------------------------------------------------------------
 
-def stage_extract(cfg: dict, paths, db_path: str) -> None:
+def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> None:
     """Stage 2: EXIF + quality + CLIP + face + privacy."""
     max_dim = cfg["ingestion"]["max_dimension"]
     q_cfg   = cfg["quality"]
@@ -136,6 +191,12 @@ def stage_extract(cfg: dict, paths, db_path: str) -> None:
                 "is_private": int(is_priv),
                 "processed_at": time.time(),
             })
+
+            # Mirror embeddings into the vector store for O(log N) search
+            store.upsert_clip(path_str, clip_emb)
+            if face_emb is not None:
+                store.upsert_face(path_str, face_emb)
+
             processed += 1
 
         conn.commit()
@@ -209,27 +270,44 @@ def stage_sentiment(cfg: dict, db_path: str, paths) -> None:
     print(f"  Scored sentiment for {updates} photos")
 
 
-def stage_dedup(cfg: dict, db_path: str) -> int:
-    """Stage 6: Mark near-duplicate photos."""
+def stage_dedup(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
+    """Stage 6: Mark near-duplicate photos.
+
+    Uses ANN-accelerated deduplication via the vector store when embeddings
+    are available (O(N·K) instead of O(N²)).  Falls back to the brute-force
+    scan if the store is empty (e.g. first run before sync completes).
+    """
     dup_cfg = cfg["deduplication"]
 
     with database.connect(db_path) as conn:
         rows = database.get_all(conn, "quality_pass=1 AND is_private=0")
         records = [
             {
-                "path":      r["path"],
-                "file_hash": r["file_hash"],
-                "phash":     r["phash"],
-                "clip_emb":  database.blob_to_emb(r["clip_emb"]),
+                "path":       r["path"],
+                "file_hash":  r["file_hash"],
+                "phash":      r["phash"],
+                "clip_emb":   database.blob_to_emb(r["clip_emb"]),
                 "blur_score": r["blur_score"],
             }
             for r in rows
         ]
+
+    if store.clip_count() > 0:
+        dup_paths = deduplication.find_duplicates_ann(
+            records,
+            store,
+            phash_threshold=dup_cfg["phash_threshold"],
+            embedding_threshold=dup_cfg["embedding_similarity"],
+        )
+    else:
+        # Fallback: brute-force O(N²) scan (small libraries or first run)
         dup_paths = deduplication.find_duplicates(
             records,
             phash_threshold=dup_cfg["phash_threshold"],
             embedding_threshold=dup_cfg["embedding_similarity"],
         )
+
+    with database.connect(db_path) as conn:
         for p in dup_paths:
             database.update_fields(conn, p, is_duplicate=1)
         conn.commit()
@@ -238,32 +316,46 @@ def stage_dedup(cfg: dict, db_path: str) -> int:
     return len(dup_paths)
 
 
-def stage_cluster(cfg: dict, db_path: str) -> int:
-    """Stage 7: DBSCAN event clustering."""
+def stage_cluster(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
+    """Stage 7: DBSCAN event clustering.
+
+    CLIP embeddings are fetched from the vector store instead of decoding
+    SQLite BLOBs, avoiding the memory spike that caused crashes at 50k photos.
+    """
     cl_cfg = cfg["clustering"]
 
+    # Fetch scalar metadata only — no BLOB columns needed
     with database.connect(db_path) as conn:
-        rows = database.get_all(
-            conn, "quality_pass=1 AND is_private=0 AND is_duplicate=0"
-        )
-        records = [
-            {
-                "path":      r["path"],
-                "timestamp": r["timestamp"],
-                "lat":       r["lat"],
-                "lon":       r["lon"],
-                "clip_emb":  database.blob_to_emb(r["clip_emb"]),
-            }
-            for r in rows
-        ]
-        cluster_map = clustering.cluster_events(
-            records,
-            eps=cl_cfg["eps"],
-            min_samples=cl_cfg["min_samples"],
-            time_weight=cl_cfg["time_weight"],
-            gps_weight=cl_cfg["gps_weight"],
-            visual_weight=cl_cfg["visual_weight"],
-        )
+        rows = conn.execute(
+            "SELECT path, timestamp, lat, lon FROM photos "
+            "WHERE quality_pass=1 AND is_private=0 AND is_duplicate=0"
+        ).fetchall()
+
+    # Pull all CLIP embeddings from the vector store in one batch
+    clip_paths, clip_matrix = store.get_all_clip()
+    clip_index: dict = dict(zip(clip_paths, clip_matrix))
+
+    records = [
+        {
+            "path":      r["path"],
+            "timestamp": r["timestamp"],
+            "lat":       r["lat"],
+            "lon":       r["lon"],
+            "clip_emb":  clip_index.get(r["path"]),
+        }
+        for r in rows
+    ]
+
+    cluster_map = clustering.cluster_events(
+        records,
+        eps=cl_cfg["eps"],
+        min_samples=cl_cfg["min_samples"],
+        time_weight=cl_cfg["time_weight"],
+        gps_weight=cl_cfg["gps_weight"],
+        visual_weight=cl_cfg["visual_weight"],
+    )
+
+    with database.connect(db_path) as conn:
         for path, cid in cluster_map.items():
             database.update_fields(conn, path, cluster_id=cid)
         conn.commit()
@@ -273,29 +365,44 @@ def stage_cluster(cfg: dict, db_path: str) -> int:
     return n_events
 
 
-def stage_face_clustering(cfg: dict, db_path: str) -> None:
-    """Stage 8: Cross-photo person identity clustering."""
+def stage_face_clustering(cfg: dict, db_path: str, store: "vs.VectorStore") -> None:
+    """Stage 8: Cross-photo person identity clustering.
+
+    Face embeddings are fetched from the vector store instead of decoding
+    SQLite BLOBs.
+    """
     fc_cfg = cfg.get("face_clustering", {})
     if not fc_cfg.get("enabled", True):
         print("  Face clustering disabled — skipping")
         return
 
+    # Fetch scalar metadata only
     with database.connect(db_path) as conn:
-        rows = database.get_all(conn, "face_count >= 1")
-        records = [
-            {
-                "path":      r["path"],
-                "face_count": r["face_count"],
-                "face_emb":  database.blob_to_emb(r["face_emb"]),
-            }
-            for r in rows
-        ]
-        identity_map = face_clustering.cluster_identities(
-            records,
-            eps=fc_cfg.get("eps", 0.8),
-            min_samples=fc_cfg.get("min_samples", 2),
-            frequent_threshold=fc_cfg.get("frequent_person_threshold", 5),
-        )
+        rows = conn.execute(
+            "SELECT path, face_count FROM photos WHERE face_count >= 1"
+        ).fetchall()
+
+    # Pull all face embeddings from the vector store in one batch
+    face_paths, face_matrix = store.get_all_face()
+    face_index: dict = dict(zip(face_paths, face_matrix))
+
+    records = [
+        {
+            "path":       r["path"],
+            "face_count": r["face_count"],
+            "face_emb":   face_index.get(r["path"]),
+        }
+        for r in rows
+    ]
+
+    identity_map = face_clustering.cluster_identities(
+        records,
+        eps=fc_cfg.get("eps", 0.8),
+        min_samples=fc_cfg.get("min_samples", 2),
+        frequent_threshold=fc_cfg.get("frequent_person_threshold", 5),
+    )
+
+    with database.connect(db_path) as conn:
         for path, (pid, is_freq) in identity_map.items():
             database.update_fields(conn, path, person_id=pid, is_frequent=int(is_freq))
         conn.commit()
@@ -394,6 +501,16 @@ def run(
         print(f"  Resuming from stage {from_stage}")
     print()
 
+    # ── Vector store (HNSW-backed ChromaDB) ───────────────────────
+    print("[0/9] Initialising vector store…")
+    store = _init_vector_store(cfg)
+    _sync_store_from_sqlite(db_path, store)
+    print(
+        f"  Vector store ready — "
+        f"CLIP={store.clip_count()}  face={store.face_count()}"
+    )
+    print()
+
     t0 = time.time()
 
     def _stage(n: int, label: str):
@@ -417,7 +534,7 @@ def run(
 
     # ── Stage 2: Feature extraction ───────────────────────────────
     if _stage(2, "Extracting features"):
-        stage_extract(cfg, paths, db_path)
+        stage_extract(cfg, paths, db_path, store)
 
     # ── Stage 3: Aesthetic scoring ────────────────────────────────
     if _stage(3, "Aesthetic scoring"):
@@ -433,19 +550,19 @@ def run(
 
     # ── Stage 6: Deduplication ────────────────────────────────────
     if _stage(6, "Deduplication"):
-        n_dups = stage_dedup(cfg, db_path)
+        n_dups = stage_dedup(cfg, db_path, store)
     else:
         n_dups = 0
 
     # ── Stage 7: Event clustering ─────────────────────────────────
     if _stage(7, "Event clustering"):
-        n_events = stage_cluster(cfg, db_path)
+        n_events = stage_cluster(cfg, db_path, store)
     else:
         n_events = 0
 
     # ── Stage 8: Face identity clustering ────────────────────────
     if _stage(8, "Face identity clustering"):
-        stage_face_clustering(cfg, db_path)
+        stage_face_clustering(cfg, db_path, store)
 
     # ── Stage 9: Rank + select + output ──────────────────────────
     if _stage(9, "Ranking & selecting"):
