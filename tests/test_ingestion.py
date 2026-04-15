@@ -130,53 +130,63 @@ class TestComputeFileHash:
 # ---------------------------------------------------------------------------
 
 class TestLoadImageSafe:
+    """load_image_safe returns (img, orig_shorter_side) or (None, 0)."""
+
     def _create_jpg(self, tmp_path: Path, name: str = "img.jpg", size=(200, 200)) -> Path:
         p = tmp_path / name
         img = Image.new("RGB", size, color=(100, 150, 200))
         img.save(p, "JPEG")
         return p
 
+    def test_returns_tuple(self, tmp_path: Path):
+        p = self._create_jpg(tmp_path)
+        result = load_image_safe(p, max_dimension=1024)
+        assert isinstance(result, tuple) and len(result) == 2
+
     def test_returns_pil_image(self, tmp_path: Path):
         p = self._create_jpg(tmp_path)
-        img = load_image_safe(p, max_dimension=1024)
+        img, shorter = load_image_safe(p, max_dimension=1024)
         assert isinstance(img, Image.Image)
+        assert shorter == 200
 
     def test_converts_to_rgb(self, tmp_path: Path):
-        # Save as grayscale
         p = tmp_path / "gray.jpg"
         Image.new("L", (50, 50), color=128).save(p, "JPEG")
-        img = load_image_safe(p, max_dimension=1024)
+        img, _ = load_image_safe(p, max_dimension=1024)
         assert img is not None
         assert img.mode == "RGB"
 
-    def test_resizes_large_image(self, tmp_path: Path):
+    def test_loads_at_original_resolution(self, tmp_path: Path):
+        """Downscaling is disabled — large images stay full-resolution."""
         p = self._create_jpg(tmp_path, size=(4000, 3000))
-        img = load_image_safe(p, max_dimension=1024)
+        img, shorter = load_image_safe(p, max_dimension=1024)
         assert img is not None
-        assert max(img.size) <= 1024
+        assert img.size == (4000, 3000)
+        assert shorter == 3000
 
     def test_small_image_not_upscaled(self, tmp_path: Path):
         p = self._create_jpg(tmp_path, size=(100, 100))
-        img = load_image_safe(p, max_dimension=1024)
+        img, shorter = load_image_safe(p, max_dimension=1024)
         assert img is not None
         assert img.size == (100, 100)
+        assert shorter == 100
 
     def test_missing_file_returns_none(self, tmp_path: Path):
         p = tmp_path / "nonexistent.jpg"
-        result = load_image_safe(p, max_dimension=1024)
-        assert result is None
+        img, shorter = load_image_safe(p, max_dimension=1024)
+        assert img is None
+        assert shorter == 0
 
     def test_corrupted_file_returns_none(self, tmp_path: Path):
         p = tmp_path / "bad.jpg"
         p.write_bytes(b"not a jpeg at all !!!!")
-        result = load_image_safe(p, max_dimension=1024)
-        assert result is None
+        img, shorter = load_image_safe(p, max_dimension=1024)
+        assert img is None
+        assert shorter == 0
 
-    def test_aspect_ratio_preserved(self, tmp_path: Path):
-        """Resizing should preserve aspect ratio."""
-        p = self._create_jpg(tmp_path, size=(2000, 1000))  # 2:1 aspect
-        img = load_image_safe(p, max_dimension=1000)
+    def test_orig_shorter_side_for_landscape(self, tmp_path: Path):
+        """2000x1000 landscape — shorter side is 1000."""
+        p = self._create_jpg(tmp_path, size=(2000, 1000))
+        img, shorter = load_image_safe(p, max_dimension=1000)
         assert img is not None
-        w, h = img.size
-        ratio = w / h
-        assert abs(ratio - 2.0) < 0.1
+        assert shorter == 1000

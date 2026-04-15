@@ -149,14 +149,15 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                 skipped += 1
                 continue
 
-            img = ingestion.load_image_safe(path, max_dim)
+            img, orig_shorter = ingestion.load_image_safe(path, max_dim)
             if img is None:
                 continue
 
             exif       = metadata.extract_exif(path)
             q          = quality.assess(img, **{k: q_cfg[k] for k in (
                              "min_blur_score", "min_exposure_score",
-                             "max_exposure_score", "min_resolution")})
+                             "max_exposure_score", "min_resolution")},
+                             orig_resolution=orig_shorter)
             clip_emb   = embeddings.extract(img, clip_model, clip_preprocess, clip_device)
             phash_str  = deduplication.compute_phash(img)
             face_count, face_emb = face_detection.detect(img)
@@ -250,7 +251,7 @@ def stage_sentiment(cfg: dict, db_path: str, paths) -> None:
     min_faces = cfg.get("sentiment", {}).get("min_face_for_sentiment", 1)
 
     with database.connect(db_path) as conn:
-        rows = database.get_all(conn, f"face_count >= {min_faces}")
+        rows = database.get_all(conn, "face_count >= ?", (min_faces,))
         path_to_row = {row["path"]: row for row in rows}
         updates = 0
 
@@ -259,7 +260,7 @@ def stage_sentiment(cfg: dict, db_path: str, paths) -> None:
             desc="  Sentiment",
             unit="img",
         ):
-            img = ingestion.load_image_safe(path, max_dim)
+            img, _ = ingestion.load_image_safe(path, max_dim)
             if img is None:
                 continue
             score = sentiment.score_image(img)
@@ -414,28 +415,18 @@ def stage_face_clustering(cfg: dict, db_path: str, store: "vs.VectorStore") -> N
     print(f"  Identified {len(frequent_ids)} frequent people  ({len(identity_map)} face-tagged photos)")
 
 
-def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool) -> tuple:
-    """Stage 9: Rank, select (30/30/40), and write output."""
-    rank_cfg    = cfg["ranking"]["weights"]
-    sel_cfg     = cfg["selection"]
-    out_cfg     = cfg["output"]
-    subj_cfg    = cfg.get("subject_priority", {})
+def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: int = 0) -> tuple:
+    """Stage 9: Rank, select via dynamic buckets, and write output."""
+    rank_cfg = cfg["ranking"]["weights"]
+    sel_cfg  = cfg["selection"]
+    out_cfg  = cfg["output"]
 
     with database.connect(db_path) as conn:
         rows    = database.get_all(conn, "quality_pass=1 AND is_private=0 AND is_duplicate=0")
         records = [dict(r) for r in rows]
 
-    # ── Subject priority scores ───────────────────────────────────
-    subject_scores = None
-    if subj_cfg.get("enabled", False) and subj_cfg.get("subjects"):
-        print(f"  Computing subject priority scores "
-              f"({len(subj_cfg['subjects'])} subjects)…")
-        subject_scores = subject_priority.compute_scores(records, subj_cfg)
-        matched = sum(1 for v in subject_scores.values() if v > 0.01)
-        print(f"  Subject boost applied to {matched}/{len(records)} photos")
-
     # ── Score ─────────────────────────────────────────────────────
-    scores = ranking.score_photos(records, rank_cfg, subject_scores=subject_scores)
+    scores = ranking.score_photos(records, rank_cfg)
 
     with database.connect(db_path) as conn:
         for path, score in scores.items():
@@ -443,6 +434,29 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool) -> tuple:
         conn.commit()
 
     print(f"  Scored {len(scores)} photos")
+
+    # ── Dynamic buckets ──────────────────────────────────────────
+    bucket_cfg = sel_cfg.get("buckets", {
+        "people": 0.30, "location": 0.30, "aesthetic": 0.40,
+    })
+
+    # Identify CLIP subject buckets (anything that isn't people/location/aesthetic)
+    subject_bucket_names = [
+        name for name in bucket_cfg
+        if name not in ("people", "location", "aesthetic")
+    ]
+
+    # Compute per-subject CLIP similarity scores
+    bucket_subject_scores: dict = {}
+    if subject_bucket_names and records:
+        print(f"  Computing CLIP scores for subject buckets: "
+              f"{', '.join(subject_bucket_names)}…")
+        for name in subject_bucket_names:
+            bucket_subject_scores[name] = subject_priority.score_single_subject(
+                records, name,
+            )
+            matched = sum(1 for v in bucket_subject_scores[name].values() if v > 0.15)
+            print(f"    {name}: {matched}/{len(records)} photos matched")
 
     # ── Select ────────────────────────────────────────────────────
     output_mode = sel_cfg.get("output_mode", "percentage")
@@ -452,20 +466,21 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool) -> tuple:
         records,
         scores,
         max_bytes=sel_cfg["max_output_bytes"],
-        max_per_cluster=sel_cfg["max_per_cluster"],
-        max_per_person=sel_cfg.get("max_per_person", 5),
-        max_per_location=sel_cfg.get("max_per_location", 15),
-        people_fraction=sel_cfg.get("people_budget_fraction", 0.30),
-        location_fraction=sel_cfg.get("location_budget_fraction", 0.30),
-        aesthetic_fraction=sel_cfg.get("aesthetic_budget_fraction", 0.40),
+        max_per_cluster_pct=sel_cfg.get("max_per_cluster_pct", 0.20),
+        max_per_person_pct=sel_cfg.get("max_per_person_pct", 0.10),
+        max_per_location_pct=sel_cfg.get("max_per_location_pct", 0.30),
+        buckets=bucket_cfg,
+        subject_scores=bucket_subject_scores,
         output_long_side=sel_cfg.get("output_long_side", 2560),
         output_jpeg_quality=sel_cfg.get("output_jpeg_quality", 92),
         output_mode=output_mode,
         output_percentage=output_pct,
+        total_photos=total_photos,
     )
 
     pct_label = (
-        f" ({output_pct*100:.0f}% of {len(records)} eligible)"
+        f" ({output_pct*100:.0f}% of {total_photos or len(records)} input photos"
+        f", {len(records)} eligible)"
         if output_mode == "percentage" else ""
     )
     print(f"  Selected {len(selected)} photos{pct_label}")
@@ -588,7 +603,7 @@ def run(
 
     # ── Stage 9: Rank + select + output ──────────────────────────
     if _stage(9, "Ranking & selecting"):
-        scores, selected = stage_rank_and_select(cfg, db_path, dry_run)
+        scores, selected = stage_rank_and_select(cfg, db_path, dry_run, total_photos=len(paths))
     else:
         selected = []
 
