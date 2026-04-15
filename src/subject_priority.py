@@ -8,6 +8,18 @@ re-inference on images is required.  Prompt vectors are built once per process
 Built-in subject presets cover common photography categories.  Any subject can
 also supply custom prompts via config.yaml to override or extend the preset.
 
+50 built-in presets grouped by category:
+  People    : human, family, kids, friends
+  Cycling   : bike, motorbike, skateboard, scooter
+  Outdoor   : landscape, nature, hiking, beach, camping, snow, water, flowers
+  Urban     : street, architecture, night, market, cafe
+  Food      : food, drinks
+  Events    : celebration, concert, festival
+  Sport     : sports, gym, running, yoga, football, basketball, swimming
+  Travel    : travel, cars, trains, planes, boats
+  Animals   : pets, wildlife, birds
+  Lifestyle : fashion, art, music, reading, gaming
+
 Usage in ranking:
     subject_scores = compute_scores(records, cfg["subject_priority"])
     # {path: boost_score}  where boost_score ∈ [0, 1]
@@ -20,7 +32,7 @@ Config shape (config.yaml):
           priority: high     # high / medium / low  →  1.0 / 0.6 / 0.3
         - name: bike
           priority: medium
-          prompts:           # optional override (replaces preset)
+          prompts:           # optional: override preset with custom prompts
             - "cycling or bicycle"
             - "mountain biking on a trail"
 """
@@ -38,11 +50,51 @@ from src import database
 # ---------------------------------------------------------------------------
 
 SUBJECT_PRESETS: Dict[str, List[str]] = {
+    # ── People ───────────────────────────────────────────────────────────────
     "human": [
         "a photo of a person smiling",
         "portrait of a person",
         "people together enjoying themselves",
     ],
+    "family": [
+        "family portrait together",
+        "parents and children spending time together",
+        "family gathering at home or outdoors",
+    ],
+    "kids": [
+        "children playing and having fun",
+        "cute kids laughing",
+        "child portrait outdoors",
+    ],
+    "friends": [
+        "group of friends laughing together",
+        "friends hanging out and socialising",
+        "people enjoying time with their friends",
+    ],
+
+    # ── Cycling & wheeled sports ─────────────────────────────────────────────
+    "bike": [
+        "cycling or bicycle riding",
+        "mountain biking on a trail",
+        "road cycling with a bicycle",
+    ],
+    "motorbike": [
+        "motorbike or motorcycle on a road",
+        "motorcycle adventure riding",
+        "biker on a motorbike",
+    ],
+    "skateboard": [
+        "skateboarding tricks at a skatepark",
+        "skateboarder performing a trick",
+        "skateboard urban skating",
+    ],
+    "scooter": [
+        "person riding a scooter or moped",
+        "electric scooter commuting",
+        "vespa scooter on a street",
+    ],
+
+    # ── Outdoor / adventure ──────────────────────────────────────────────────
     "landscape": [
         "a beautiful scenic landscape",
         "dramatic mountains and open sky",
@@ -53,60 +105,199 @@ SUBJECT_PRESETS: Dict[str, List[str]] = {
         "peaceful forest or woodland",
         "wildlife in natural habitat",
     ],
-    "bike": [
-        "cycling or bicycle riding",
-        "mountain biking on a trail",
-        "road cycling with a bicycle",
+    "hiking": [
+        "hiking on a mountain trail",
+        "trekking through nature with a backpack",
+        "hiker enjoying a scenic view",
     ],
-    "food": [
-        "delicious food or meal",
-        "beautifully plated restaurant dish",
-        "food photography close-up",
+    "beach": [
+        "beach with sand and ocean waves",
+        "people relaxing on a sunny beach",
+        "tropical beach paradise",
     ],
-    "travel": [
-        "travel photography at a famous landmark",
-        "tourist exploring a new city",
-        "iconic destination or attraction",
+    "camping": [
+        "camping in the wilderness with a tent",
+        "campfire at night outdoors",
+        "camping trip in the forest",
     ],
-    "pets": [
-        "cute pet dog or cat portrait",
-        "domestic animal looking at the camera",
-        "adorable pet photograph",
+    "snow": [
+        "snow covered landscape in winter",
+        "skiing or snowboarding on a mountain",
+        "winter snow scene",
     ],
-    "sports": [
-        "athletic sports activity or competition",
-        "outdoor fitness and exercise",
-        "sport action shot",
+    "water": [
+        "water sports surfing or kayaking",
+        "swimming in the ocean or lake",
+        "sailing or boating on water",
     ],
-    "celebration": [
-        "birthday party or celebration",
-        "wedding ceremony or reception",
-        "festive gathering with friends and family",
+    "flowers": [
+        "beautiful flowers in bloom",
+        "macro photography of flowers",
+        "garden with colourful flowers",
+    ],
+
+    # ── Urban / social ───────────────────────────────────────────────────────
+    "street": [
+        "candid street photography",
+        "urban life and street scene",
+        "documentary street moment",
     ],
     "architecture": [
         "impressive building or architectural structure",
         "historic or modern architecture",
         "urban architectural detail",
     ],
-    "cars": [
-        "sports car or classic car",
-        "automobile or vehicle photography",
-        "car on an open road",
-    ],
     "night": [
         "night photography with city lights",
         "long exposure night scene",
         "stars and night sky astrophotography",
     ],
-    "street": [
-        "candid street photography",
-        "urban life and street scene",
-        "documentary street moment",
+    "market": [
+        "outdoor market or bazaar",
+        "food market or farmers market",
+        "busy street market with vendors",
     ],
+    "cafe": [
+        "cosy coffee shop or cafe",
+        "person drinking coffee in a cafe",
+        "cafe interior with latte art",
+    ],
+
+    # ── Food & drink ─────────────────────────────────────────────────────────
+    "food": [
+        "delicious food or meal",
+        "beautifully plated restaurant dish",
+        "food photography close-up",
+    ],
+    "drinks": [
+        "colourful cocktail or drink",
+        "coffee or tea photography",
+        "wine or beer in a glass",
+    ],
+
+    # ── Events & celebration ─────────────────────────────────────────────────
+    "celebration": [
+        "birthday party or celebration",
+        "wedding ceremony or reception",
+        "festive gathering with friends and family",
+    ],
+    "concert": [
+        "live music concert with stage lights",
+        "musician performing on stage",
+        "crowd at a music festival",
+    ],
+    "festival": [
+        "outdoor festival or fair",
+        "cultural festival with costumes and colour",
+        "street festival celebration",
+    ],
+
+    # ── Sport & fitness ──────────────────────────────────────────────────────
+    "sports": [
+        "athletic sports activity or competition",
+        "outdoor fitness and exercise",
+        "sport action shot",
+    ],
+    "gym": [
+        "gym workout or weight training",
+        "fitness exercise indoors",
+        "person lifting weights at the gym",
+    ],
+    "running": [
+        "person running or jogging outdoors",
+        "marathon or road race",
+        "trail running in nature",
+    ],
+    "yoga": [
+        "yoga pose or meditation outdoors",
+        "yoga class or practice",
+        "person doing yoga on a mat",
+    ],
+    "football": [
+        "football or soccer match",
+        "players kicking a football",
+        "football game action shot",
+    ],
+    "basketball": [
+        "basketball game or practice",
+        "player shooting a basketball hoop",
+        "basketball court action",
+    ],
+    "swimming": [
+        "swimming in a pool or open water",
+        "competitive swimming race",
+        "person doing laps in a pool",
+    ],
+
+    # ── Travel & transport ───────────────────────────────────────────────────
+    "travel": [
+        "travel photography at a famous landmark",
+        "tourist exploring a new city",
+        "iconic destination or attraction",
+    ],
+    "cars": [
+        "sports car or classic car",
+        "automobile or vehicle photography",
+        "car on an open road",
+    ],
+    "trains": [
+        "train or railway photography",
+        "vintage steam train or modern high-speed rail",
+        "train station with passengers",
+    ],
+    "planes": [
+        "aircraft or aeroplane photography",
+        "plane taking off or landing",
+        "airport terminal with planes",
+    ],
+    "boats": [
+        "sailing boat or yacht on water",
+        "boat trip on a river or sea",
+        "harbour with boats and ships",
+    ],
+
+    # ── Animals & wildlife ───────────────────────────────────────────────────
+    "pets": [
+        "cute pet dog or cat portrait",
+        "domestic animal looking at the camera",
+        "adorable pet photograph",
+    ],
+    "wildlife": [
+        "wild animal in its natural habitat",
+        "wildlife photography in the savanna or jungle",
+        "bird or animal in the wild",
+    ],
+    "birds": [
+        "bird in flight or perched",
+        "bird photography in nature",
+        "colourful exotic bird",
+    ],
+
+    # ── Arts & lifestyle ─────────────────────────────────────────────────────
     "fashion": [
         "fashion photography with stylish outfit",
         "editorial fashion portrait",
         "clothing or style photography",
+    ],
+    "art": [
+        "artwork or painting in a gallery",
+        "street art or mural",
+        "creative artistic photograph",
+    ],
+    "music": [
+        "musician playing an instrument",
+        "guitar or piano being played",
+        "music practice or recording session",
+    ],
+    "reading": [
+        "person reading a book",
+        "cosy reading in a library or bookshop",
+        "books and reading corner",
+    ],
+    "gaming": [
+        "person playing video games",
+        "gaming setup with monitor and controller",
+        "esports or competitive gaming",
     ],
 }
 
@@ -211,6 +402,49 @@ def compute_scores(
         weighted = sims * priorities
         best = float(np.clip(weighted.max(), 0.0, 1.0))
         scores[path] = best
+
+    return scores
+
+
+def score_single_subject(
+    records: List[dict],
+    subject_name: str,
+) -> Dict[str, float]:
+    """
+    Score each photo against a single named subject.
+
+    Uses the built-in CLIP prompts for ``subject_name`` (from SUBJECT_PRESETS).
+    Returns {path: cosine_similarity} — 0.0 for photos with missing embeddings
+    or unknown subject names.
+    """
+    prompts = SUBJECT_PRESETS.get(subject_name)
+    if not prompts:
+        return {r["path"]: 0.0 for r in records}
+
+    # Build the direction vector for this subject (cached)
+    _build_vectors([{"name": subject_name, "priority": "high"}])
+    entry = _cache.get(subject_name)
+    if entry is None:
+        return {r["path"]: 0.0 for r in records}
+
+    _, direction = entry  # (priority_weight, direction_vector)
+
+    scores: Dict[str, float] = {}
+    for rec in records:
+        path = rec["path"]
+        emb = database.blob_to_emb(rec.get("clip_emb"))
+
+        if emb is None or emb.shape != (512,):
+            scores[path] = 0.0
+            continue
+
+        norm = np.linalg.norm(emb)
+        if norm < 1e-8:
+            scores[path] = 0.0
+            continue
+
+        sim = float(np.dot(direction, emb / norm))
+        scores[path] = max(0.0, sim)
 
     return scores
 

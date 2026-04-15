@@ -1,12 +1,15 @@
 """
-Selection engine: three-bucket diversity strategy + output resizing.
+Selection engine: dynamic bucket diversity strategy + output resizing.
 
-Budget allocation (configurable, defaults to 30/30/40):
-  ┌─────────────────────┬───────────────────────────────────────────────────┐
-  │ People bucket  (30%)│ Best N photos for each identified frequent person  │
-  │ Location bucket(30%)│ Best M photos per GPS location cluster             │
-  │ Aesthetic bucket(40%)│ Top overall scores regardless of subject         │
-  └─────────────────────┴───────────────────────────────────────────────────┘
+Budget allocation is configured via ``selection.buckets`` in config.yaml.
+Built-in bucket types:
+  people    — Best N photos for each identified frequent person
+  location  — Best M photos per GPS location cluster
+  aesthetic — Catch-all: top overall scores (must be last)
+
+Any other bucket name is a **CLIP subject bucket** — it uses built-in presets
+from subject_priority.py to match photos by visual content.  Adding a new
+subject bucket requires only a one-line config change.
 
 Output budget modes (config.yaml → selection.output_mode):
   percentage  — select output_percentage % of eligible photos (default 15 %)
@@ -28,6 +31,10 @@ from typing import Dict, List, Optional, Set
 
 import numpy as np
 from PIL import Image
+
+
+# Built-in bucket names with special selection logic
+_BUILTIN_BUCKETS = {"people", "location", "aesthetic"}
 
 
 # ---------------------------------------------------------------------------
@@ -61,38 +68,48 @@ def _resize_and_save(
 
 
 # ---------------------------------------------------------------------------
-# Three-bucket selection
+# Dynamic bucket selection
 # ---------------------------------------------------------------------------
 
 def select_photos(
     records: List[dict],
     scores: Dict[str, float],
     max_bytes: int = 1_073_741_824,
-    max_per_cluster: int = 10,
-    max_per_person: int = 5,
-    max_per_location: int = 15,
-    people_fraction: float = 0.30,
-    location_fraction: float = 0.30,
-    aesthetic_fraction: float = 0.40,
+    max_per_cluster_pct: float = 0.20,
+    max_per_person_pct: float = 0.10,
+    max_per_location_pct: float = 0.30,
+    buckets: Optional[Dict[str, float]] = None,
+    subject_scores: Optional[Dict[str, Dict[str, float]]] = None,
     output_long_side: int = 2560,
     output_jpeg_quality: int = 92,
     output_mode: str = "bytes",
     output_percentage: float = 0.15,
+    total_photos: int = 0,
 ) -> List[dict]:
     """
-    Select photos using a three-bucket diversity strategy.
+    Select photos using a dynamic bucket diversity strategy.
 
     Pre-filters duplicates, private photos, and quality failures.
 
+    Args:
+        buckets:         ordered {name: fraction} — fractions should sum to 1.0.
+                         Defaults to {"people": 0.30, "location": 0.30, "aesthetic": 0.40}.
+        subject_scores:  {bucket_name: {path: similarity}} for CLIP subject buckets.
+
     Budget modes
     ------------
-    percentage  Stop once output_percentage * len(eligible) photos are selected.
+    percentage  Stop once output_percentage * total_photos photos are selected.
     bytes       Stop once resized estimates reach max_output_bytes.
     Both modes enforce max_output_bytes as a hard cap.
 
     Returns:
         Ordered list of selected records (deduplicated across buckets).
     """
+    if buckets is None:
+        buckets = {"people": 0.30, "location": 0.30, "aesthetic": 0.40}
+    if subject_scores is None:
+        subject_scores = {}
+
     candidates = [
         r for r in records
         if r.get("quality_pass", 1)
@@ -103,26 +120,27 @@ def select_photos(
     if not candidates:
         return []
 
-    # Derive photo count target for percentage mode
+    # Derive photo count target for percentage mode.
     max_photos: Optional[int] = None
     if output_mode == "percentage":
-        max_photos = max(1, int(len(candidates) * output_percentage))
+        base = total_photos if total_photos > 0 else len(candidates)
+        target = max(1, int(base * output_percentage))
+        max_photos = min(target, len(candidates))
+
+    # ── Derive per-subject caps from the output target ────────────
+    cap_base = max_photos if max_photos is not None else len(candidates)
+    max_per_person_n   = max(1, int(cap_base * max_per_person_pct))
+    max_per_location_n = max(1, int(cap_base * max_per_location_pct))
 
     # ── Estimate output sizes after resizing ──────────────────────
-    # Approximation: resized JPEG ≈ original_size * (long_side/max_orig_dim)^2 * 0.75
     def _est_size(rec: dict) -> int:
-        orig = rec.get("file_size", 500_000)
-        res = rec.get("resolution", 1)
-        if res <= 0:
-            res = 1
-        max_dim = max(res * 1.5, 1)
-        if max_dim <= output_long_side:
-            return orig
-        scale = output_long_side / max_dim
-        return max(50_000, int(orig * scale * scale * 0.75))
+        orig = rec.get("file_size", 2_000_000)
+        return min(orig, 5_000_000)
 
     # Sort all candidates by score descending
-    sorted_cands = sorted(candidates, key=lambda r: scores.get(r["path"], 0.0), reverse=True)
+    sorted_cands = sorted(
+        candidates, key=lambda r: scores.get(r["path"], 0.0), reverse=True
+    )
     selected_paths: Set[str] = set()
     selected: List[dict] = []
     used_bytes: int = 0
@@ -131,11 +149,9 @@ def select_photos(
         nonlocal used_bytes
         if rec["path"] in selected_paths:
             return False
-        # Hard byte cap always applies
         est = _est_size(rec)
         if used_bytes + est > max_bytes:
             return False
-        # Photo count cap applies in percentage mode
         if max_photos is not None and len(selected) >= max_photos:
             return False
         selected_paths.add(rec["path"])
@@ -148,74 +164,178 @@ def select_photos(
             return True
         return used_bytes >= max_bytes
 
-    # Per-bucket byte budgets: used to distribute capacity across buckets.
-    # In percentage mode the buckets still split the photo count proportionally.
-    people_budget   = int(max_bytes * people_fraction)
-    location_budget = int(max_bytes * location_fraction)
-
-    # ── Bucket 1: People (30%) ────────────────────────────────────
-    used_people = 0
+    # Shared counters — enforced across all buckets
     person_counts: Dict[int, int] = defaultdict(int)
+    loc_counts: Dict[int, int] = defaultdict(int)
 
-    if max_photos is not None:
-        people_photo_cap = max(1, int(max_photos * people_fraction))
-    else:
-        people_photo_cap = None
+    # ── Process each bucket in config order ──────────────────────
+    # "aesthetic" is always processed last as the catch-all.
+    bucket_order = [
+        (name, frac) for name, frac in buckets.items() if name != "aesthetic"
+    ]
+    aesthetic_fraction = buckets.get("aesthetic", 0.0)
 
+    for bucket_name, fraction in bucket_order:
+        if _budget_exhausted():
+            break
+
+        bucket_byte_budget = int(max_bytes * fraction)
+        bucket_photo_cap = (
+            max(1, int(max_photos * fraction)) if max_photos is not None else None
+        )
+
+        if bucket_name == "people":
+            _fill_people_bucket(
+                sorted_cands, _add, _budget_exhausted, _est_size,
+                person_counts, max_per_person_n,
+                bucket_byte_budget, bucket_photo_cap,
+            )
+
+        elif bucket_name == "location":
+            _fill_location_bucket(
+                sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
+                person_counts, max_per_person_n,
+                loc_counts, max_per_location_n,
+                bucket_byte_budget, bucket_photo_cap,
+            )
+
+        else:
+            # CLIP subject bucket
+            subj_scores = subject_scores.get(bucket_name, {})
+            _fill_subject_bucket(
+                sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
+                person_counts, max_per_person_n,
+                subj_scores, bucket_byte_budget, bucket_photo_cap,
+            )
+
+    # ── Aesthetic catch-all (always last) ────────────────────────
+    if aesthetic_fraction > 0 and not _budget_exhausted():
+        _fill_aesthetic_bucket(
+            sorted_cands, selected_paths, _add, _budget_exhausted,
+            person_counts, max_per_person_n,
+        )
+
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Bucket fill helpers
+# ---------------------------------------------------------------------------
+
+def _fill_people_bucket(
+    sorted_cands, _add, _budget_exhausted, _est_size,
+    person_counts, max_per_person_n,
+    byte_budget, photo_cap,
+):
+    used = 0
     for rec in sorted_cands:
         if _budget_exhausted():
             break
         pid = rec.get("person_id", -1)
         if pid < 0 or not rec.get("is_frequent", 0):
             continue
-        if person_counts[pid] >= max_per_person:
+        if person_counts[pid] >= max_per_person_n:
             continue
-        if people_photo_cap is not None and sum(person_counts.values()) >= people_photo_cap:
+        if photo_cap is not None and sum(person_counts.values()) >= photo_cap:
             continue
         est = _est_size(rec)
-        if used_people + est > people_budget:
+        if used + est > byte_budget:
             continue
         if _add(rec):
             person_counts[pid] += 1
-            used_people += est
+            used += est
 
-    # ── Bucket 2: Location diversity (30%) ───────────────────────
-    used_location = 0
-    loc_counts: Dict[int, int] = defaultdict(int)
 
-    if max_photos is not None:
-        location_photo_cap = max(1, int(max_photos * location_fraction))
-    else:
-        location_photo_cap = None
-
-    location_selected = 0
+def _fill_location_bucket(
+    sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
+    person_counts, max_per_person_n,
+    loc_counts, max_per_location_n,
+    byte_budget, photo_cap,
+):
+    used = 0
+    bucket_selected = 0
     for rec in sorted_cands:
         if _budget_exhausted():
             break
         if rec["path"] in selected_paths:
             continue
         cid = rec.get("cluster_id", -1)
-        if loc_counts[cid] >= max_per_location:
+        if loc_counts[cid] >= max_per_location_n:
             continue
-        if location_photo_cap is not None and location_selected >= location_photo_cap:
+        pid = rec.get("person_id", -1)
+        if pid >= 0 and person_counts[pid] >= max_per_person_n:
+            continue
+        if photo_cap is not None and bucket_selected >= photo_cap:
             continue
         est = _est_size(rec)
-        if used_location + est > location_budget:
+        if used + est > byte_budget:
             continue
         if _add(rec):
             loc_counts[cid] += 1
-            used_location += est
-            location_selected += 1
+            used += est
+            bucket_selected += 1
+            if pid >= 0:
+                person_counts[pid] += 1
 
-    # ── Bucket 3: Aesthetic top picks (40%) ──────────────────────
+
+def _fill_subject_bucket(
+    sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
+    person_counts, max_per_person_n,
+    subj_scores, byte_budget, photo_cap,
+):
+    """Fill a CLIP subject bucket.
+
+    Candidates are sorted by their subject similarity (descending) so the
+    best matches for this subject are picked first.
+    """
+    # Re-sort by subject similarity for this bucket
+    subj_sorted = sorted(
+        sorted_cands,
+        key=lambda r: subj_scores.get(r["path"], 0.0),
+        reverse=True,
+    )
+
+    used = 0
+    bucket_selected = 0
+    for rec in subj_sorted:
+        if _budget_exhausted():
+            break
+        if rec["path"] in selected_paths:
+            continue
+        # Skip photos with negligible subject match
+        if subj_scores.get(rec["path"], 0.0) < 0.15:
+            break  # sorted descending — rest will be even lower
+        pid = rec.get("person_id", -1)
+        if pid >= 0 and person_counts[pid] >= max_per_person_n:
+            continue
+        if photo_cap is not None and bucket_selected >= photo_cap:
+            break
+        est = _est_size(rec)
+        if used + est > byte_budget:
+            continue
+        if _add(rec):
+            used += est
+            bucket_selected += 1
+            if pid >= 0:
+                person_counts[pid] += 1
+
+
+def _fill_aesthetic_bucket(
+    sorted_cands, selected_paths, _add, _budget_exhausted,
+    person_counts, max_per_person_n,
+):
+    """Aesthetic catch-all — fills remaining budget with highest-scored photos."""
     for rec in sorted_cands:
         if _budget_exhausted():
             break
         if rec["path"] in selected_paths:
             continue
-        _add(rec)
-
-    return selected
+        pid = rec.get("person_id", -1)
+        if pid >= 0 and person_counts[pid] >= max_per_person_n:
+            continue
+        if _add(rec):
+            if pid >= 0:
+                person_counts[pid] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +360,7 @@ def copy_to_output(
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    
+
     # Clean previous output to prevent accumulating duplicates with _1 suffixes
     for old_file in out.glob("*"):
         if old_file.is_file() and old_file.name != ".gitkeep":

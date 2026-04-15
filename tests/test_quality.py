@@ -180,3 +180,23 @@ class TestAssess:
             min_resolution=1,
         )
         assert result.passes is True
+
+    def test_widescreen_fails_without_orig_resolution(self):
+        """1024×576 processing image (16:9) fails min_resolution=640 without orig info."""
+        img = _checkerboard((1024, 576))
+        result = assess(img, min_resolution=640)
+        assert result.resolution == 576
+        assert result.passes is False
+
+    def test_widescreen_passes_with_orig_resolution(self):
+        """Same 1024×576 processing image passes when orig shorter side is known (2268)."""
+        img = _checkerboard((1024, 576))
+        result = assess(img, min_resolution=640, orig_resolution=2268)
+        assert result.resolution == 2268
+        assert result.passes is True
+
+    def test_orig_resolution_zero_falls_back_to_img_size(self):
+        """orig_resolution=0 means 'not provided' — falls back to min(img.size)."""
+        img = _checkerboard((800, 800))
+        result = assess(img, orig_resolution=0)
+        assert result.resolution == 800

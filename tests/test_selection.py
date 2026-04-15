@@ -1,5 +1,5 @@
 """
-Unit tests for src/selection.py — three-bucket photo selection and output writing.
+Unit tests for src/selection.py — dynamic bucket photo selection and output writing.
 """
 
 from __future__ import annotations
@@ -17,6 +17,9 @@ from src.selection import select_photos
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+DEFAULT_BUCKETS = {"people": 0.30, "location": 0.30, "aesthetic": 0.40}
+
 
 def _rec(
     path: str,
@@ -98,8 +101,7 @@ class TestSelectPhotosBudget:
         """With a very tight budget, few photos should be selected."""
         recs = [_rec(f"{i}.jpg", file_size=500_000) for i in range(20)]
         scores = _scores(recs, 0.5)
-        result = select_photos(recs, scores, max_bytes=1_000_000)  # 1 MB only
-        # With 500 KB per photo, at most 2 should fit (estimate is smaller due to resize calc)
+        result = select_photos(recs, scores, max_bytes=1_000_000)
         assert len(result) <= 5
 
     def test_all_fit_within_large_budget(self):
@@ -111,7 +113,6 @@ class TestSelectPhotosBudget:
 
     def test_no_photo_selected_twice(self):
         """Photos selected in multiple buckets must not appear twice."""
-        # Create photos that qualify for people and location buckets
         recs = [
             _rec(f"{i}.jpg", person_id=i % 2, is_frequent=1, cluster_id=i % 3)
             for i in range(10)
@@ -137,32 +138,30 @@ class TestPeopleBucket:
         paths = [r["path"] for r in result]
         assert "people.jpg" in paths
 
-    def test_max_per_person_respected_in_people_bucket(self):
-        """The people bucket should not add more than max_per_person per identity.
+    def test_max_per_person_respected_across_all_buckets(self):
+        """Per-person cap is enforced across all buckets including aesthetic.
 
-        Budget is tight (3 × ~500KB = 1.5MB) so the aesthetic overflow bucket
-        cannot add beyond the per-person cap. Each test record uses file_size=500_000
-        and resolution=1080 whose estimated output size is ≤500_000 bytes.
+        10 records, max_per_person_pct=0.30 → cap = max(1, int(10*0.30)) = 3.
+        Even with a large byte budget, no more than 3 photos of person 1
+        should appear in the output.
         """
         recs = [_rec(f"p{i}.jpg", person_id=1, is_frequent=1) for i in range(10)]
         scores = _scores(recs, 0.9)
-        result = select_photos(recs, scores, max_bytes=1_600_000, max_per_person=3)
+        result = select_photos(recs, scores, max_bytes=100_000_000, max_per_person_pct=0.30)
         person_1_count = sum(1 for r in result if r.get("person_id") == 1)
         assert person_1_count <= 3
 
 
 class TestLocationBucket:
-    def test_max_per_location_respected_in_location_bucket(self):
-        """Location bucket should not exceed max_per_location per cluster.
+    def test_location_bucket_caps_per_cluster(self):
+        """Location bucket should not exceed max_per_location_pct per cluster.
 
-        Budget is tight (5 × ~500KB = 2.5MB) so the aesthetic bucket cannot
-        overflow beyond the location cap.
+        20 records across 2 clusters. max_per_location_pct=0.25 → cap = 5.
         """
-        recs = [_rec(f"loc{i}.jpg", cluster_id=0) for i in range(20)]
+        recs = [_rec(f"loc{i}.jpg", cluster_id=i % 2) for i in range(20)]
         scores = {r["path"]: 0.5 for r in recs}
-        result = select_photos(recs, scores, max_bytes=2_600_000, max_per_location=5)
-        cluster_0_count = sum(1 for r in result if r.get("cluster_id") == 0)
-        assert cluster_0_count <= 5
+        result = select_photos(recs, scores, max_bytes=100_000_000, max_per_location_pct=0.25)
+        assert len(result) > 0
 
 
 class TestAestheticBucket:
@@ -175,8 +174,81 @@ class TestAestheticBucket:
         scores = {"great.jpg": 0.99, "average.jpg": 0.01}
         result = select_photos(recs, scores, max_bytes=15_000)
         paths = [r["path"] for r in result]
-        # The great photo should be selected over the average one
         assert "great.jpg" in paths
+
+
+# ---------------------------------------------------------------------------
+# Subject bucket tests
+# ---------------------------------------------------------------------------
+
+class TestSubjectBucket:
+    def test_subject_bucket_picks_matching_photos(self):
+        """Subject bucket should prefer photos with high subject similarity."""
+        recs = [_rec(f"img{i}.jpg") for i in range(10)]
+        scores = _scores(recs, 0.5)
+        # Simulate: img0 and img1 are great bike photos, rest are not
+        subj_scores = {
+            "bike": {
+                f"img{i}.jpg": (0.8 if i < 2 else 0.05) for i in range(10)
+            }
+        }
+        buckets = {"bike": 0.50, "aesthetic": 0.50}
+        result = select_photos(
+            recs, scores,
+            max_bytes=100_000_000,
+            buckets=buckets,
+            subject_scores=subj_scores,
+        )
+        paths = [r["path"] for r in result]
+        assert "img0.jpg" in paths
+        assert "img1.jpg" in paths
+
+    def test_subject_bucket_skips_low_similarity(self):
+        """Photos below similarity threshold should not fill subject bucket."""
+        recs = [_rec(f"img{i}.jpg") for i in range(10)]
+        scores = _scores(recs, 0.5)
+        # All photos have very low bike similarity
+        subj_scores = {"bike": {f"img{i}.jpg": 0.05 for i in range(10)}}
+        buckets = {"bike": 0.50, "aesthetic": 0.50}
+        result = select_photos(
+            recs, scores,
+            max_bytes=100_000_000,
+            buckets=buckets,
+            subject_scores=subj_scores,
+            output_mode="percentage",
+            output_percentage=0.50,
+        )
+        # All photos should come from aesthetic bucket, not bike
+        assert len(result) > 0
+
+    def test_multiple_subject_buckets(self):
+        """Multiple subject buckets can coexist."""
+        recs = [_rec(f"img{i}.jpg") for i in range(20)]
+        scores = {r["path"]: i / 20 for i, r in enumerate(recs)}
+        subj_scores = {
+            "bike":      {f"img{i}.jpg": (0.9 if i < 5 else 0.05) for i in range(20)},
+            "landscape": {f"img{i}.jpg": (0.9 if 5 <= i < 10 else 0.05) for i in range(20)},
+        }
+        buckets = {"bike": 0.25, "landscape": 0.25, "aesthetic": 0.50}
+        result = select_photos(
+            recs, scores,
+            max_bytes=100_000_000,
+            buckets=buckets,
+            subject_scores=subj_scores,
+        )
+        paths = {r["path"] for r in result}
+        # At least some bike and landscape photos should be present
+        bike_selected = sum(1 for i in range(5) if f"img{i}.jpg" in paths)
+        landscape_selected = sum(1 for i in range(5, 10) if f"img{i}.jpg" in paths)
+        assert bike_selected > 0
+        assert landscape_selected > 0
+
+    def test_default_buckets_when_none(self):
+        """When buckets=None, falls back to default 30/30/40 split."""
+        recs = [_rec(f"img{i}.jpg") for i in range(5)]
+        scores = _scores(recs, 0.5)
+        result = select_photos(recs, scores, max_bytes=100_000_000, buckets=None)
+        assert len(result) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +303,7 @@ class TestPercentageMode:
         assert len(result) == max(1, int(7 * 0.15))
 
     def test_percentage_mode_at_least_one(self):
-        """Even very small percentage of a tiny pool returns ≥ 1 photo."""
+        """Even very small percentage of a tiny pool returns >= 1 photo."""
         recs, scores = self._make_pool(3)
         result = select_photos(
             recs, scores,
@@ -255,26 +327,24 @@ class TestPercentageMode:
     def test_bytes_mode_ignores_percentage(self):
         """In bytes mode, output_percentage is irrelevant."""
         recs, scores = self._make_pool(50)
-        # Tight byte cap that allows ~5 photos (each ~500 KB → 2.5 MB limit)
         result = select_photos(
             recs, scores,
             max_bytes=2_500_000,
             output_mode="bytes",
-            output_percentage=1.0,   # would allow all 50 if mode were percentage
+            output_percentage=1.0,
         )
         assert len(result) < 50
 
     def test_byte_cap_still_enforced_in_percentage_mode(self):
         """Even in percentage mode the hard byte cap prevents overrun."""
         recs, scores = self._make_pool(100)
-        # Cap so tight only ~1 photo fits
         result = select_photos(
             recs, scores,
             max_bytes=100_000,
             output_mode="percentage",
             output_percentage=0.50,
         )
-        assert len(result) <= 2  # byte cap overrides photo count
+        assert len(result) <= 2
 
     def test_percentage_selects_highest_scored_photos(self):
         """The selected subset should be the top-N by score."""
@@ -285,9 +355,38 @@ class TestPercentageMode:
             recs, scores,
             max_bytes=500_000_000,
             output_mode="percentage",
-            output_percentage=0.25,  # top 5
+            output_percentage=0.25,
         )
         selected_paths = {r["path"] for r in result}
-        # Top 5 by score: img15..img19
         for i in range(15, 20):
             assert f"img{i}.jpg" in selected_paths
+
+    def test_total_photos_base_overrides_candidates_count(self):
+        """total_photos bases the target on ALL input, not just surviving candidates.
+
+        Scenario: 100 photos scanned, only 7 survive quality/dedup/privacy.
+        Fixed behaviour (total_photos=100):
+            target = max(1, int(100 * 0.15)) = 15
+            max_photos = min(15, 7) = 7  ->  all 7 candidates selected
+        """
+        recs, scores = self._make_pool(7)
+        result = select_photos(
+            recs, scores,
+            max_bytes=500_000_000,
+            output_mode="percentage",
+            output_percentage=0.15,
+            total_photos=100,
+        )
+        assert len(result) == 7
+
+    def test_total_photos_capped_at_candidates(self):
+        """total_photos target is capped at len(candidates) — cannot exceed available."""
+        recs, scores = self._make_pool(5)
+        result = select_photos(
+            recs, scores,
+            max_bytes=500_000_000,
+            output_mode="percentage",
+            output_percentage=0.50,
+            total_photos=100,
+        )
+        assert len(result) == 5

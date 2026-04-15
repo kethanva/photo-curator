@@ -59,55 +59,8 @@ sentiment:
   enabled: true
   min_face_for_sentiment: 1  # only run on photos with ≥ N faces
 
-# ── Face Identity Clustering ────────────────────────────────────────────────
-face_clustering:
-  enabled: true
-  eps: 0.8                     # DBSCAN eps for face embeddings (0.6–1.0)
-  min_samples: 2
-  frequent_person_threshold: 5 # min photos to be classified as "frequent person"
-
-# ── Subject Priority ─────────────────────────────────────────────────────────
-# Photos matching these subjects receive a score boost during ranking,
-# making them more likely to be selected in the output.
-#
-# Built-in preset names (use as-is without specifying prompts):
-#   human, landscape, nature, bike, food, travel, pets, sports,
-#   celebration, architecture, cars, night, street, fashion
-#
-# Priority tiers:
-#   high   → 1.0 boost multiplier
-#   medium → 0.6 boost multiplier
-#   low    → 0.3 boost multiplier
-#
-# Custom subjects: specify prompts to override or extend any preset.
-# Re-running from --from-stage 9 picks up subject changes instantly.
-subject_priority:
-  enabled: true
-  subjects:
-    - name: human
-      priority: high
-    - name: landscape
-      priority: high
-    - name: nature
-      priority: medium
-    # Uncomment or add subjects as needed:
-    # - name: pets
-    #   priority: medium
-    # - name: travel
-    #   priority: medium
-    # - name: celebration
-    #   priority: high
-    # Custom subject with your own CLIP prompts:
-    # - name: bike
-    #   priority: medium
-    #   prompts:
-    #     - "cycling or bicycle on a trail"
-    #     - "mountain biking adventure"
-    #     - "road cyclist in motion"
-
 # ── Ranking weights ──────────────────────────────────────────────────────────
-# Base weights (sharpness … diversity_bonus) do not need to sum to 1.0.
-# subject_boost is additive on top; set to 0.0 to disable.
+# Base weights do not need to sum to 1.0.
 ranking:
   weights:
     sharpness:           0.15
@@ -117,7 +70,6 @@ ranking:
     uniqueness:          0.15
     metadata_importance: 0.08
     diversity_bonus:     0.07
-    subject_boost:       0.20   # additive boost for subject-priority photos
 
 # ── Selection — output budget + 30 / 30 / 40 diversity strategy ─────────────
 selection:
@@ -126,18 +78,31 @@ selection:
   #   bytes       → fill up to max_output_bytes (1 GB default)
   # Both modes still apply the byte cap as a hard upper limit.
   output_mode: percentage       # 'percentage' or 'bytes'
-  output_percentage: 0.15       # 15 % of eligible photos (output_mode=percentage)
+  output_percentage: 0.20       # 20 % of eligible photos (output_mode=percentage)
   max_output_bytes: 1_073_741_824   # 1 GB hard cap (always enforced)
 
   # Bucket fractions (must sum to 1.0)
-  people_budget_fraction:    0.30  # top photos per frequent person
-  location_budget_fraction:  0.30  # top photos per GPS cluster
-  aesthetic_budget_fraction: 0.40  # highest overall scores
+  # Built-in types: people (face clusters), location (GPS clusters), aesthetic (catch-all)
+  # Any other name is a CLIP subject bucket — uses built-in presets from subject_priority.py.
+  # Available presets: human, family, kids, friends, bike, motorbike, skateboard,
+  #   scooter, landscape, nature, hiking, beach, camping, snow, water, flowers,
+  #   street, architecture, night, market, cafe, food, drinks, celebration,
+  #   concert, festival, sports, gym, running, yoga, football, basketball,
+  #   swimming, travel, cars, trains, planes, boats, pets, wildlife, birds,
+  #   fashion, art, music, reading, gaming
+  # To add a new subject bucket, just add a line — no code changes needed.
+  buckets:
+    people:     0.20    # best photos per frequent person
+    location:   0.20    # best photos per GPS cluster
+    bike:       0.10    # CLIP-matched cycling/bicycle photos
+    landscape:  0.10    # CLIP-matched scenic landscape photos
+    aesthetic:  0.40    # catch-all: highest overall scores
 
-  # Per-bucket caps
-  max_per_person:   5    # max photos of any single identified person
-  max_per_location: 15   # max photos from any single location cluster
-  max_per_cluster:  10   # event-cluster cap (backup diversity guard)
+  # Per-bucket caps — fraction of the output target (0.0 – 1.0)
+  # Example: 50 output photos → 0.10 = 5, 0.30 = 15, 0.20 = 10
+  max_per_person_pct:   0.10   # max share of output for any single identified person
+  max_per_location_pct: 0.30   # max share of output from any single GPS cluster
+  max_per_cluster_pct:  0.20   # event-cluster cap (backup diversity guard)
 
   # Output resizing — dramatically increases photos that fit in budget
   resize_output:       true

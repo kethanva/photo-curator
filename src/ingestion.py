@@ -34,8 +34,17 @@ def compute_file_hash(path: Path, chunk_size: int = 65536) -> str:
 
 def load_image_safe(path: Path, max_dimension: int = 1024):
     """
-    Open image as RGB PIL Image, resized so the longest side <= max_dimension.
-    Returns None on failure.  Handles HEIC via pillow-heif if installed.
+    Open image as RGB PIL Image at its original resolution.
+
+    Returns a 2-tuple ``(img, orig_shorter_side)``:
+      - ``img``: full-resolution PIL Image (RGB), or ``None`` on failure.
+      - ``orig_shorter_side``: shorter dimension of the image in pixels,
+        or 0 on failure.
+
+    Handles HEIC/HEIF via pillow-heif if installed.
+
+    Note: ``max_dimension`` is accepted for API compatibility but the
+    downscaling step is disabled — photos are loaded at full resolution.
     """
     from PIL import Image, ImageFile
     ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -51,9 +60,11 @@ def load_image_safe(path: Path, max_dimension: int = 1024):
     try:
         img = Image.open(path).convert("RGB")
         w, h = img.size
-        scale = min(1.0, max_dimension / max(w, h))
-        if scale < 1.0:
-            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-        return img
+        orig_shorter = min(w, h)
+        # Downscaling disabled — process and store at original resolution.
+        # scale = min(1.0, max_dimension / max(w, h))
+        # if scale < 1.0:
+        #     img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        return img, orig_shorter
     except Exception:
-        return None
+        return None, 0
