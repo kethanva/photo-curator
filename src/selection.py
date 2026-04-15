@@ -110,6 +110,11 @@ def select_photos(
     if subject_scores is None:
         subject_scores = {}
 
+    # Normalise bucket fractions to sum to 1.0
+    total_frac = sum(buckets.values())
+    if total_frac > 0 and abs(total_frac - 1.0) > 1e-6:
+        buckets = {k: v / total_frac for k, v in buckets.items()}
+
     candidates = [
         r for r in records
         if r.get("quality_pass", 1)
