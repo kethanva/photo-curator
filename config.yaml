@@ -81,7 +81,7 @@ selection:
   output_percentage: 0.20       # 20 % of eligible photos (output_mode=percentage)
   max_output_bytes: 1_073_741_824   # 1 GB hard cap (always enforced)
 
-  # Bucket fractions (must sum to 1.0)
+  # Bucket fractions (auto-normalised to sum to 1.0)
   # Built-in types: people (face clusters), location (GPS clusters), aesthetic (catch-all)
   # Any other name is a CLIP subject bucket — uses built-in presets from subject_priority.py.
   # Available presets: human, family, kids, friends, bike, motorbike, skateboard,
@@ -92,15 +92,15 @@ selection:
   #   fashion, art, music, reading, gaming
   # To add a new subject bucket, just add a line — no code changes needed.
   buckets:
-    people:     0.20    # best photos per frequent person
-    location:   0.20    # best photos per GPS cluster
+    people:     0.40    # best photos per frequent person
+    location:   0.30    # best photos per GPS cluster
     bike:       0.10    # CLIP-matched cycling/bicycle photos
     landscape:  0.10    # CLIP-matched scenic landscape photos
-    aesthetic:  0.40    # catch-all: highest overall scores
+    aesthetic:  0.10    # catch-all: highest overall scores
 
   # Per-bucket caps — fraction of the output target (0.0 – 1.0)
   # Example: 50 output photos → 0.10 = 5, 0.30 = 15, 0.20 = 10
-  max_per_person_pct:   0.10   # max share of output for any single identified person
+  max_per_person_pct:   0.50   # max share of output for any single identified person
   max_per_location_pct: 0.30   # max share of output from any single GPS cluster
   max_per_cluster_pct:  0.20   # event-cluster cap (backup diversity guard)
 

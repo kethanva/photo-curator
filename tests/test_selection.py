@@ -250,6 +250,22 @@ class TestSubjectBucket:
         result = select_photos(recs, scores, max_bytes=100_000_000, buckets=None)
         assert len(result) == 5
 
+    def test_buckets_normalised_when_over_one(self):
+        """Fractions summing to > 1.0 are normalised — all photos still selected."""
+        recs = [_rec(f"img{i}.jpg") for i in range(10)]
+        scores = _scores(recs, 0.5)
+        buckets = {"people": 0.50, "location": 0.40, "aesthetic": 0.60}  # sum = 1.5
+        result = select_photos(recs, scores, max_bytes=100_000_000, buckets=buckets)
+        assert len(result) == 10
+
+    def test_buckets_normalised_when_under_one(self):
+        """Fractions summing to < 1.0 are normalised — all photos still selected."""
+        recs = [_rec(f"img{i}.jpg") for i in range(10)]
+        scores = _scores(recs, 0.5)
+        buckets = {"people": 0.10, "location": 0.10, "aesthetic": 0.10}  # sum = 0.3
+        result = select_photos(recs, scores, max_bytes=100_000_000, buckets=buckets)
+        assert len(result) == 10
+
 
 # ---------------------------------------------------------------------------
 # Size estimation tests
