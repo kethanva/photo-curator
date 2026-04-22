@@ -50,6 +50,8 @@ def init_db(db_path: str) -> None:
                 -- face
                 face_count      INTEGER DEFAULT 0,
                 face_emb        BLOB,
+                face_prominence REAL    DEFAULT 0,
+                face_confidence REAL    DEFAULT 0,
                 -- flags
                 is_duplicate    INTEGER DEFAULT 0,
                 is_private      INTEGER DEFAULT 0,
@@ -71,11 +73,13 @@ def init_db(db_path: str) -> None:
         """)
 
         # Migrate existing databases that predate the new columns
-        _add_column_if_missing(conn, "photos", "aesthetic_score", "REAL DEFAULT 0")
-        _add_column_if_missing(conn, "photos", "scene_tags",      "TEXT DEFAULT ''")
-        _add_column_if_missing(conn, "photos", "smile_score",     "REAL DEFAULT 0.5")
-        _add_column_if_missing(conn, "photos", "person_id",       "INTEGER DEFAULT -1")
-        _add_column_if_missing(conn, "photos", "is_frequent",     "INTEGER DEFAULT 0")
+        _add_column_if_missing(conn, "photos", "aesthetic_score",  "REAL DEFAULT 0")
+        _add_column_if_missing(conn, "photos", "scene_tags",       "TEXT DEFAULT ''")
+        _add_column_if_missing(conn, "photos", "smile_score",      "REAL DEFAULT 0.5")
+        _add_column_if_missing(conn, "photos", "person_id",        "INTEGER DEFAULT -1")
+        _add_column_if_missing(conn, "photos", "is_frequent",      "INTEGER DEFAULT 0")
+        _add_column_if_missing(conn, "photos", "face_prominence",  "REAL DEFAULT 0")
+        _add_column_if_missing(conn, "photos", "face_confidence",  "REAL DEFAULT 0")
 
 
 def _add_column_if_missing(

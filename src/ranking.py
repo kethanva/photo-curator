@@ -1,14 +1,16 @@
 """
 Ranking engine: computes a composite quality + importance score for each photo.
 
-Score = weighted sum of seven normalised components:
+Score = weighted sum of nine normalised components:
     sharpness           — Laplacian blur score
-    aesthetic           — CLIP-based aesthetic prediction (replaces old proxy)
-    face_score          — log-scaled face count (people matter)
+    aesthetic           — CLIP-based aesthetic prediction
+    face_score          — log-scaled face count
+    face_prominence     — face bounding-box area / image area (close-ups score higher)
+    face_confidence     — mean MTCNN detection probability (rewards clearly detected faces)
     sentiment           — smile + eyes-open score from MediaPipe
-    uniqueness          — penalises duplicates / near-duplicates
+    uniqueness          — rewards photos from small / unique event clusters
     metadata_importance — GPS + timestamp signals a meaningful moment
-    diversity_bonus     — rewards photos from larger event clusters
+    diversity_bonus     — rewards photos from well-formed event clusters
 """
 
 from __future__ import annotations
@@ -63,6 +65,19 @@ def score_photos(
     face_log = np.log1p(np.clip(face_raw, 0, 10))
     face_score = _minmax(face_log)
 
+    # ── Face prominence ──────────────────────────────────────────
+    # Fraction of frame area covered by qualifying faces.
+    # Close-up portraits (face fills ~30 % of frame) score much higher than
+    # crowd shots where faces are tiny. Capped at 1.0 by face_detection.
+    face_prom_raw = np.array([r.get("face_prominence", 0.0) for r in records], dtype=float)
+    face_prominence = _minmax(face_prom_raw)
+
+    # ── Face confidence ──────────────────────────────────────────
+    # Mean MTCNN detection probability. Rewards unambiguously detected faces
+    # over borderline / partial detections.
+    face_conf_raw = np.array([r.get("face_confidence", 0.0) for r in records], dtype=float)
+    face_confidence = _minmax(face_conf_raw)
+
     # ── Sentiment ────────────────────────────────────────────────
     # Smile + eyes-open from MediaPipe; 0.5 for photos with no faces
     sentiment_raw = np.array([r.get("smile_score", 0.5) for r in records], dtype=float)
@@ -115,13 +130,15 @@ def score_photos(
     # ── Base weighted sum ────────────────────────────────────────
     w = weights
     total = (
-        w.get("sharpness",          0.15) * sharpness
-        + w.get("aesthetic",        0.25) * aesthetic
-        + w.get("face_score",       0.15) * face_score
-        + w.get("sentiment",        0.15) * sentiment
-        + w.get("uniqueness",       0.15) * uniqueness
-        + w.get("metadata_importance", 0.08) * meta
-        + w.get("diversity_bonus",  0.07) * diversity_bonus
+        w.get("sharpness",           0.10) * sharpness
+        + w.get("aesthetic",         0.20) * aesthetic
+        + w.get("face_score",        0.18) * face_score
+        + w.get("face_prominence",   0.10) * face_prominence
+        + w.get("face_confidence",   0.05) * face_confidence
+        + w.get("sentiment",         0.18) * sentiment
+        + w.get("uniqueness",        0.10) * uniqueness
+        + w.get("metadata_importance", 0.05) * meta
+        + w.get("diversity_bonus",   0.04) * diversity_bonus
     )
 
     return {path: float(score) for path, score in zip(paths, total)}

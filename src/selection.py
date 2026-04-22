@@ -172,10 +172,11 @@ def select_photos(
         and num_clusters * max_per_cluster_n >= target_for_cap
     )
 
-    # Hour cap: only enforce when total hour capacity covers the target.
-    # With e.g. 20 distinct hours × cap=1 = 20 capacity < 27 target → disabled.
-    # When enforced, raise cap to ceil(target/num_hours) so target is reachable
-    # while still limiting consecutive-hour bursts.
+    # Hour cap: always enforce when there are >= 2 distinct timestamp hours.
+    # Raise cap to ceil(target/num_hours) so the target remains reachable,
+    # while still preventing a single hour from dominating the output.
+    # Previously the cap was disabled when hour-capacity < target, which caused
+    # same-timerange photos to pile up. Now it always fires for >= 2 hours.
     if max_per_hour_pct > 0.0:
         distinct_hours = {
             int((r.get("timestamp", 0) or 0) / 3600)
@@ -183,13 +184,13 @@ def select_photos(
             if (r.get("timestamp", 0) or 0) > 0
         }
         num_hours = len(distinct_hours)
-        raw_hour_cap = max(1, int(cap_base * max_per_hour_pct))
-        if num_hours >= 2 and num_hours * raw_hour_cap >= target_for_cap:
-            # Raise cap to at least ceil(target/num_hours) so target is reachable
+        if num_hours >= 2:
+            raw_hour_cap = max(1, int(cap_base * max_per_hour_pct))
+            # Raise cap so the total reachable output equals at least the target
             min_needed = max(1, int(np.ceil(target_for_cap / num_hours)))
             max_per_hour_n: Optional[int] = max(raw_hour_cap, min_needed)
         else:
-            max_per_hour_n = None  # too few distinct hours — skip cap
+            max_per_hour_n = None  # single hour or no timestamps — skip cap
     else:
         max_per_hour_n = None
 

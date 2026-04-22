@@ -1,7 +1,15 @@
 """
 Face detection and embedding extraction using facenet-pytorch.
 
-Returns per-image face count and an averaged 512-dim face embedding.
+Returns per-image face count, averaged 512-dim embedding, face prominence
+(fraction of image area covered by qualifying faces), and mean detection
+confidence.
+
+Quality filters applied before counting:
+  - Face bounding box must cover >= 0.5 % of the image area (excludes tiny
+    background bystanders).
+  - MTCNN detection probability must be >= 0.80 (rejects uncertain detections).
+
 MTCNN runs on CPU for stability; FaceNet runs on MPS/CUDA/CPU.
 
 Install:
@@ -10,6 +18,7 @@ Install:
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import numpy as np
@@ -19,6 +28,11 @@ from PIL import Image
 _mtcnn = None
 _facenet = None
 _device = None
+
+# Minimum MTCNN probability to count a face
+_MIN_PROB: float = 0.80
+# Minimum face area as a fraction of image area
+_MIN_FACE_AREA_FRAC: float = 0.005
 
 
 def _select_device():
@@ -53,58 +67,115 @@ def load_models() -> Tuple:
         device="cpu",
         post_process=False,
         select_largest=False,
+        min_face_size=20,       # pixels — ignore sub-20px detections
     )
     _facenet = InceptionResnetV1(pretrained="vggface2").eval().to(_device)
     return _mtcnn, _facenet, _device
 
 
-def detect(img: Image.Image) -> Tuple[int, Optional[np.ndarray]]:
+def detect(
+    img: Image.Image,
+) -> Tuple[int, Optional[np.ndarray], float, float]:
     """
-    Detect faces in a PIL Image and return count + averaged embedding.
+    Detect faces and compute quality metrics.
+
+    Two-pass approach:
+      Pass 1 — ``mtcnn.detect()`` returns bounding boxes + probabilities;
+               used for quality filtering, prominence, and confidence.
+      Pass 2 — ``mtcnn()`` returns cropped face tensors for FaceNet embedding.
 
     Args:
         img: PIL Image (RGB)
 
     Returns:
-        face_count: number of faces found (0 if none)
-        avg_embedding: mean 512-dim float32 vector, or None if no faces
+        face_count:      qualifying face count after size + confidence filtering
+        avg_embedding:   mean 512-dim float32 FaceNet embedding (None if 0 faces)
+        face_prominence: qualifying face area / image area, capped at 1.0
+        face_confidence: mean MTCNN detection probability for qualifying faces
     """
     import torch
 
     mtcnn, facenet, device = load_models()
 
+    img_w, img_h = img.size
+    img_area = max(1, img_w * img_h)
+    min_face_area = img_area * _MIN_FACE_AREA_FRAC
+
     try:
-        faces = mtcnn(img)  # Tensor (N,3,160,160) or None
+        # ── Pass 1: bounding boxes + probabilities ────────────────
+        boxes, probs = mtcnn.detect(img)
+
+        if boxes is None or probs is None:
+            return 0, None, 0.0, 0.0
+
+        # Filter to qualifying faces (large enough + high confidence)
+        valid_boxes, valid_probs = [], []
+        for box, prob in zip(boxes, probs):
+            if prob is None or float(prob) < _MIN_PROB:
+                continue
+            bw = max(0.0, float(box[2] - box[0]))
+            bh = max(0.0, float(box[3] - box[1]))
+            if bw * bh >= min_face_area:
+                valid_boxes.append(box)
+                valid_probs.append(float(prob))
+
+        if not valid_boxes:
+            return 0, None, 0.0, 0.0
+
+        face_count = len(valid_boxes)
+
+        # Prominence: fraction of frame occupied by qualifying faces
+        face_area = sum(
+            max(0.0, float(b[2] - b[0])) * max(0.0, float(b[3] - b[1]))
+            for b in valid_boxes
+        )
+        face_prominence = float(min(1.0, face_area / img_area))
+        face_confidence = float(np.mean(valid_probs))
+
+        # ── Pass 2: face crops for FaceNet embedding ──────────────
+        faces = mtcnn(img)  # Tensor (N, 3, 160, 160) or None
 
         if faces is None:
-            return 0, None
+            return face_count, None, face_prominence, face_confidence
 
         if faces.dim() == 3:
-            faces = faces.unsqueeze(0)  # Single face → batch of 1
+            faces = faces.unsqueeze(0)
 
-        face_count = faces.shape[0]
+        # Embed only up to face_count crops (skips background bystanders)
+        n_embed = min(faces.shape[0], face_count)
+        faces = faces[:n_embed]
 
-        # Pixel range from MTCNN (0–255) → normalise to [-1, 1]
+        # Pixel range (0–255) → normalised to [-1, 1] for FaceNet
         faces_norm = (faces.float() / 127.5) - 1.0
         faces_norm = faces_norm.to(device)
 
         with torch.no_grad():
-            embeddings = facenet(faces_norm)  # (N, 512)
+            embedding_vecs = facenet(faces_norm)  # (N, 512)
 
-        avg_emb = embeddings.mean(dim=0).cpu().numpy().astype(np.float32)
-        return face_count, avg_emb
+        avg_emb = embedding_vecs.mean(dim=0).cpu().numpy().astype(np.float32)
+        return face_count, avg_emb, face_prominence, face_confidence
 
     except Exception:
-        return 0, None
+        return 0, None, 0.0, 0.0
 
 
-def face_score(face_count: int, max_faces: int = 6) -> float:
+def face_score(
+    face_count: int,
+    face_prominence: float = 0.0,
+    max_faces: int = 6,
+) -> float:
     """
-    Convert face count to a 0–1 score.
-    Peaks at ~3–4 faces (group photos), diminishes above max_faces.
+    Composite face presence score [0–1].
+
+    Blends log-scaled face count (people matter) with subject prominence
+    (how much of the frame the faces fill — a close-up portrait scores higher
+    than distant background faces).
+
+    65 % count (log-scaled) + 35 % prominence.
     """
     if face_count == 0:
         return 0.0
-    # Log scale so a single face already registers, groups score higher
-    import math
-    return min(1.0, math.log(face_count + 1) / math.log(max_faces + 1))
+    count_s = min(1.0, math.log(face_count + 1) / math.log(max_faces + 1))
+    # Prominence: ~25 % face coverage → prominence=0.25, scaled to ~0.75
+    prom_s = min(1.0, face_prominence * 3.0)
+    return 0.65 * count_s + 0.35 * prom_s
