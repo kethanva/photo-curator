@@ -16,8 +16,14 @@ Install:
 
 from __future__ import annotations
 
+import os
 import numpy as np
 from PIL import Image
+
+# Silence MediaPipe's C++ INFO/WARNING logs (GL context, feedback manager, etc.)
+# These are harmless runtime notes from the Metal GPU backend on Apple Silicon.
+os.environ.setdefault("GLOG_minloglevel", "2")       # suppress INFO + WARNING
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")   # suppress TF/XLA noise
 
 # ---------------------------------------------------------------------------
 # MediaPipe landmark indices (468-point Face Mesh)

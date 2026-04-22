@@ -171,7 +171,12 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                 home_radius_km=p_cfg["home_radius_km"],
                 filter_screenshots=p_cfg["filter_screenshots"],
                 filter_documents=p_cfg["filter_documents"],
+                filter_text_heavy=p_cfg.get("filter_text_heavy", True),
                 filter_home_private=p_cfg["filter_home_private"],
+                filter_reshared=p_cfg.get("filter_reshared", True),
+                reshared_prefixes=p_cfg.get("reshared_prefixes"),
+                path=path,
+                clip_emb=clip_emb,
             )
 
             database.upsert(conn, {
@@ -270,6 +275,23 @@ def stage_sentiment(cfg: dict, db_path: str, paths) -> None:
         conn.commit()
 
     print(f"  Scored sentiment for {updates} photos")
+
+
+def stage_reassess_privacy(cfg: dict, db_path: str) -> None:
+    """Re-apply privacy rules to all cached photos using stored embeddings.
+
+    Runs cheaply on every pipeline start — no image file I/O needed.
+    Ensures photos ingested before a rule change get correct is_private flags.
+    """
+    p_cfg = cfg["privacy"]
+    with database.connect(db_path) as conn:
+        total, changed = privacy.reassess_is_private_from_cache(
+            conn,
+            filter_reshared=p_cfg.get("filter_reshared", True),
+            reshared_prefixes=p_cfg.get("reshared_prefixes"),
+            filter_text_heavy=p_cfg.get("filter_text_heavy", True),
+        )
+    print(f"  Privacy re-assessed: {total} photos, {changed} updated")
 
 
 def stage_dedup(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
@@ -446,6 +468,17 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: 
         if name not in ("people", "location", "aesthetic")
     ]
 
+    # Validate subject bucket names against built-in presets; warn loudly
+    # so a config typo ("landscap") doesn't silently empty a bucket.
+    known_presets = set(subject_priority.list_presets())
+    unknown = [n for n in subject_bucket_names if n not in known_presets]
+    if unknown:
+        print(
+            f"  WARNING: Unknown subject bucket(s) in config.yaml: "
+            f"{', '.join(unknown)}. These will select 0 photos. "
+            f"Available presets: {', '.join(sorted(known_presets))}"
+        )
+
     # Compute per-subject CLIP similarity scores
     bucket_subject_scores: dict = {}
     if subject_bucket_names and records:
@@ -469,6 +502,8 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: 
         max_per_cluster_pct=sel_cfg.get("max_per_cluster_pct", 0.20),
         max_per_person_pct=sel_cfg.get("max_per_person_pct", 0.10),
         max_per_location_pct=sel_cfg.get("max_per_location_pct", 0.30),
+        max_per_hour_pct=sel_cfg.get("max_per_hour_pct", 0.05),
+        min_score_pct=sel_cfg.get("min_score_pct", 0.0),
         buckets=bucket_cfg,
         subject_scores=bucket_subject_scores,
         output_long_side=sel_cfg.get("output_long_side", 2560),
@@ -476,6 +511,7 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: 
         output_mode=output_mode,
         output_percentage=output_pct,
         total_photos=total_photos,
+        resize_output=sel_cfg.get("resize_output", True),
     )
 
     pct_label = (
@@ -584,6 +620,10 @@ def run(
     # ── Stage 5: Sentiment ────────────────────────────────────────
     if _stage(5, "Smile & eye detection"):
         stage_sentiment(cfg, db_path, paths)
+
+    # ── Privacy re-assessment (always runs — no image I/O, uses cached embeddings)
+    print("[*/9] Re-assessing privacy rules on cached photos…")
+    stage_reassess_privacy(cfg, db_path)
 
     # ── Stage 6: Deduplication ────────────────────────────────────
     if _stage(6, "Deduplication"):

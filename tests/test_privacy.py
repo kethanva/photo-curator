@@ -14,8 +14,10 @@ from PIL import Image
 from src.privacy import (
     _SCREEN_RESOLUTIONS,
     _haversine_km,
+    _is_private_from_probs,
     assess,
     is_home_private,
+    is_reshared_filename,
     is_screenshot,
 )
 
@@ -199,6 +201,179 @@ class TestAssess:
                 lat=48.8, lon=2.3, face_count=2,
                 home=None, home_radius_km=0.5,
                 filter_screenshots=True,
+                filter_documents=True,
+                filter_home_private=False,
+            )
+        assert result is False
+
+    def test_document_embedding_fast_path_used_when_provided(self):
+        """When a clip_emb is supplied, assess routes to is_document_from_embedding,
+        not is_document_clip (which would otherwise re-run CLIP on the image)."""
+        img = self._img()
+        emb = np.ones(512, dtype=np.float32)
+        with patch("src.privacy.is_document_from_embedding", return_value=True) as emb_check, \
+             patch("src.privacy.is_document_clip", return_value=False) as img_check:
+            result = assess(
+                img=img,
+                camera_model="iPhone", has_gps=True,
+                lat=0.0, lon=0.0, face_count=1,
+                home=None, home_radius_km=0.5,
+                filter_screenshots=False,
+                filter_documents=True,
+                filter_home_private=False,
+                clip_emb=emb,
+            )
+        assert result is True
+        emb_check.assert_called_once()
+        img_check.assert_not_called()
+
+    def test_document_image_path_used_when_no_embedding(self):
+        """Without clip_emb, assess falls back to is_document_clip (original path)."""
+        img = self._img()
+        with patch("src.privacy.is_document_from_embedding", return_value=False) as emb_check, \
+             patch("src.privacy.is_document_clip", return_value=True) as img_check:
+            result = assess(
+                img=img,
+                camera_model="iPhone", has_gps=True,
+                lat=0.0, lon=0.0, face_count=1,
+                home=None, home_radius_km=0.5,
+                filter_screenshots=False,
+                filter_documents=True,
+                filter_home_private=False,
+            )
+        assert result is True
+        img_check.assert_called_once()
+        emb_check.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Reshared-filename tests
+# ---------------------------------------------------------------------------
+
+class TestIsPrivateFromProbs:
+    """Locks in the (threshold, ratio) gate that prevents over-flagging."""
+
+    def _probs(self, best_private: float, normal: float) -> np.ndarray:
+        # 10 private prompts + 1 normal = 11 slots; fill rest with uniform
+        # residual so the array sums to 1.0 (as real softmax output would).
+        n_priv = 10
+        residual = max(0.0, 1.0 - best_private - normal) / (n_priv - 1)
+        arr = np.full(n_priv + 1, residual, dtype=float)
+        arr[0] = best_private
+        arr[-1] = normal
+        return arr
+
+    def test_clear_document_flagged(self):
+        # Genuine document: 0.80 private vs 0.05 normal → 16× ratio
+        assert _is_private_from_probs(self._probs(0.80, 0.05)) is True
+
+    def test_borderline_vacation_photo_not_flagged(self):
+        # Vacation photo that drifts up on "social media screenshot"
+        # but normal prompt is still close → caught by ratio gate.
+        assert _is_private_from_probs(self._probs(0.47, 0.30)) is False
+
+    def test_absolute_threshold_enforced(self):
+        # Even with infinite ratio (normal ≈ 0), below threshold = pass.
+        assert _is_private_from_probs(self._probs(0.40, 0.001)) is False
+
+    def test_ratio_gate_enforced(self):
+        # Above threshold but normal is comparable → pass (not dominant)
+        assert _is_private_from_probs(self._probs(0.52, 0.40)) is False
+
+    def test_custom_threshold_and_ratio(self):
+        probs = self._probs(0.55, 0.20)
+        assert _is_private_from_probs(probs, threshold=0.50, ratio=1.8) is True
+        assert _is_private_from_probs(probs, threshold=0.60, ratio=1.8) is False
+        assert _is_private_from_probs(probs, threshold=0.50, ratio=3.0) is False
+
+
+class TestIsResharedFilename:
+    @pytest.mark.parametrize("name", [
+        "FB_IMG_1558616482459.jpg",
+        "fb_img_1234.jpg",
+        "IMG-WA0001.jpg",
+        "IMG-WA20230101-WA0007.jpg",
+        "WhatsApp Image 2024-01-01 at 10.00.00.jpeg",
+        "received_1234567890.jpeg",
+        "Screenshot_20240101-103000.png",
+        "Screen Shot 2024-01-01 at 10.00.00 AM.png",
+        "insta_save_123.jpg",
+        "telegram_photo.jpg",
+    ])
+    def test_reshared_names_flagged(self, name):
+        assert is_reshared_filename(name) is True
+
+    @pytest.mark.parametrize("name", [
+        "IMG_20190303_194319.jpg",   # legit Android camera
+        "IMG_1234.HEIC",             # legit iOS camera
+        "DSC00123.JPG",              # legit DSLR
+        "PXL_20240101_103000.jpg",   # legit Pixel camera
+        "vacation.jpg",
+    ])
+    def test_regular_names_not_flagged(self, name):
+        assert is_reshared_filename(name) is False
+
+    def test_full_path_uses_leaf_only(self):
+        assert is_reshared_filename("/foo/bar/FB_IMG_42.jpg") is True
+        assert is_reshared_filename("/foo/FB_IMG_/actual_photo.jpg") is False
+
+    def test_custom_prefix_list(self):
+        assert is_reshared_filename("CUSTOM_123.jpg", prefixes=["custom_"]) is True
+        # Defaults no longer apply when a custom list is provided
+        assert is_reshared_filename("FB_IMG_1.jpg", prefixes=["custom_"]) is False
+
+
+class TestAssessReshared:
+    """Reshared-filename gate inside assess()."""
+
+    def _img(self) -> Image.Image:
+        return Image.new("RGB", (1024, 768), color=(100, 100, 100))
+
+    def test_reshared_filename_excluded(self):
+        """A path matching a reshare prefix is rejected before CLIP runs."""
+        with patch("src.privacy.is_document_clip", return_value=False) as doc_check, \
+             patch("src.privacy.is_document_from_embedding", return_value=False) as emb_check:
+            result = assess(
+                img=self._img(),
+                camera_model="iPhone", has_gps=True,
+                lat=37.0, lon=-122.0, face_count=1,
+                home=None, home_radius_km=0.5,
+                filter_screenshots=False,
+                filter_documents=True,
+                filter_home_private=False,
+                filter_reshared=True,
+                path="/photos/FB_IMG_12345.jpg",
+            )
+        assert result is True
+        # CLIP checks must be short-circuited since filename filter hit first.
+        doc_check.assert_not_called()
+        emb_check.assert_not_called()
+
+    def test_reshared_disabled_allows_through(self):
+        """filter_reshared=False skips the filename filter entirely."""
+        with patch("src.privacy.is_document_clip", return_value=False):
+            result = assess(
+                img=self._img(),
+                camera_model="iPhone", has_gps=True,
+                lat=37.0, lon=-122.0, face_count=1,
+                home=None, home_radius_km=0.5,
+                filter_screenshots=False,
+                filter_documents=True,
+                filter_home_private=False,
+                filter_reshared=False,
+                path="/photos/FB_IMG_12345.jpg",
+            )
+        assert result is False
+
+    def test_missing_path_skips_filename_check(self):
+        """Back-compat: old callers that don't pass path must still work."""
+        with patch("src.privacy.is_document_clip", return_value=False):
+            result = assess(
+                img=self._img(),
+                camera_model="iPhone", has_gps=True,
+                lat=37.0, lon=-122.0, face_count=1,
+                home=None, home_radius_km=0.5,
+                filter_screenshots=False,
                 filter_documents=True,
                 filter_home_private=False,
             )

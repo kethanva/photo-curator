@@ -69,9 +69,23 @@ def score_photos(
     sentiment = _minmax(sentiment_raw)
 
     # ── Uniqueness ───────────────────────────────────────────────
-    uniqueness = np.array(
-        [0.0 if r.get("is_duplicate", 0) else 1.0 for r in records]
+    # Duplicates are already filtered upstream, so a binary is_duplicate flag
+    # is constant (all 1.0) for eligible photos and gives zero discrimination.
+    # Define uniqueness as inverse event-cluster density: photos from small
+    # clusters (or noise singletons) are more "unique moments" than the 500th
+    # photo of a wedding.
+    cluster_ids = [r.get("cluster_id", -1) for r in records]
+    cluster_sizes = Counter(cluster_ids)
+    # Noise (cluster_id == -1) is a collection of singletons, not a real
+    # cluster, so each such photo should read as maximally unique.
+    uniqueness_raw = np.array(
+        [
+            1.0 if cid < 0 else 1.0 / float(cluster_sizes[cid])
+            for cid in cluster_ids
+        ],
+        dtype=float,
     )
+    uniqueness = _minmax(uniqueness_raw)
 
     # ── Metadata importance ──────────────────────────────────────
     meta = np.array(
@@ -84,11 +98,17 @@ def score_photos(
     )
 
     # ── Diversity bonus ──────────────────────────────────────────
-    cluster_ids = [r.get("cluster_id", -1) for r in records]
-    cluster_sizes = Counter(cluster_ids)
-    max_size = max(cluster_sizes.values(), default=1)
+    # Rewards photos from well-formed event clusters (weddings, trips) without
+    # double-counting DBSCAN noise: cluster_id == -1 is a bag of unrelated
+    # singletons, so it should not dominate the "max cluster size" reference.
+    real_sizes = {cid: n for cid, n in cluster_sizes.items() if cid >= 0}
+    max_size = max(real_sizes.values(), default=1)
     diversity_raw = np.array(
-        [cluster_sizes[cid] / max_size for cid in cluster_ids], dtype=float
+        [
+            0.0 if cid < 0 else cluster_sizes[cid] / max_size
+            for cid in cluster_ids
+        ],
+        dtype=float,
     )
     diversity_bonus = _minmax(diversity_raw)
 

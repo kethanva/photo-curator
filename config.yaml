@@ -32,10 +32,18 @@ deduplication:
 
 privacy:
   filter_screenshots: true
-  filter_documents: true      # CLIP zero-shot doc/ID detection
+  filter_documents: true      # CLIP zero-shot doc / ID / meme / text-overlay detection
+  filter_text_heavy: true     # binary CLIP check for chat screenshots / text-only images saved with camera filenames
   filter_home_private: false  # enable to filter solo shots at home
   home_coords: null           # [lat, lon] or null
   home_radius_km: 0.5
+  # Reshared / forwarded content filter (filename-based, free and fast)
+  filter_reshared: true
+  # Leaf filename prefixes (case-insensitive) treated as forwarded content.
+  # Leave commented to use built-in defaults: FB_IMG_, IMG-WA, WhatsApp,
+  # received_, Screenshot, Screen Shot, insta_, twitter_, tweet_, telegram_,
+  # viber image, signal-.
+  # reshared_prefixes: ["fb_img_", "img-wa", "whatsapp", "screenshot"]
 
 clustering:
   time_weight: 1.0
@@ -64,12 +72,12 @@ sentiment:
 ranking:
   weights:
     sharpness:           0.15
-    aesthetic:           0.25   # CLIP / LAION aesthetic score
+    aesthetic:           0.35   # CLIP / LAION aesthetic score — primary signal
     face_score:          0.15
     sentiment:           0.15   # smile + eyes open (MediaPipe)
-    uniqueness:          0.15
-    metadata_importance: 0.08
-    diversity_bonus:     0.07
+    uniqueness:          0.12
+    metadata_importance: 0.05
+    diversity_bonus:     0.03
 
 # ── Selection — output budget + 30 / 30 / 40 diversity strategy ─────────────
 selection:
@@ -100,9 +108,11 @@ selection:
 
   # Per-bucket caps — fraction of the output target (0.0 – 1.0)
   # Example: 50 output photos → 0.10 = 5, 0.30 = 15, 0.20 = 10
-  max_per_person_pct:   0.50   # max share of output for any single identified person
-  max_per_location_pct: 0.30   # max share of output from any single GPS cluster
-  max_per_cluster_pct:  0.20   # event-cluster cap (backup diversity guard)
+  max_per_person_pct:   0.25   # max share of output for any single identified person
+  max_per_location_pct: 0.25   # max share of output from any single GPS cluster
+  max_per_cluster_pct:  0.12   # event-cluster cap (backup diversity guard)
+  max_per_hour_pct:     0.05   # max share from any single calendar hour (temporal spread)
+  min_score_pct:        0.15   # drop bottom 15% of photos by composite score
 
   # Output resizing — dramatically increases photos that fit in budget
   resize_output:       true

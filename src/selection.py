@@ -78,6 +78,8 @@ def select_photos(
     max_per_cluster_pct: float = 0.20,
     max_per_person_pct: float = 0.10,
     max_per_location_pct: float = 0.30,
+    max_per_hour_pct: float = 0.05,
+    min_score_pct: float = 0.0,
     buckets: Optional[Dict[str, float]] = None,
     subject_scores: Optional[Dict[str, Dict[str, float]]] = None,
     output_long_side: int = 2560,
@@ -85,6 +87,7 @@ def select_photos(
     output_mode: str = "bytes",
     output_percentage: float = 0.15,
     total_photos: int = 0,
+    resize_output: bool = True,
 ) -> List[dict]:
     """
     Select photos using a dynamic bucket diversity strategy.
@@ -92,9 +95,14 @@ def select_photos(
     Pre-filters duplicates, private photos, and quality failures.
 
     Args:
-        buckets:         ordered {name: fraction} — fractions should sum to 1.0.
-                         Defaults to {"people": 0.30, "location": 0.30, "aesthetic": 0.40}.
-        subject_scores:  {bucket_name: {path: similarity}} for CLIP subject buckets.
+        buckets:          ordered {name: fraction} — fractions should sum to 1.0.
+                          Defaults to {"people": 0.30, "location": 0.30, "aesthetic": 0.40}.
+        subject_scores:   {bucket_name: {path: similarity}} for CLIP subject buckets.
+        max_per_hour_pct: max fraction of output from any single calendar hour.
+                          0.0 disables the cap.
+        min_score_pct:    drop the bottom fraction of candidates by composite score
+                          before selection (e.g. 0.15 drops the lowest-scored 15%).
+                          0.0 disables the filter.
 
     Budget modes
     ------------
@@ -125,22 +133,77 @@ def select_photos(
     if not candidates:
         return []
 
-    # Derive photo count target for percentage mode.
+    # Derive photo count target for percentage mode BEFORE score filtering,
+    # so the target reflects the eligible pool size, not the post-filter remainder.
     max_photos: Optional[int] = None
     if output_mode == "percentage":
         base = total_photos if total_photos > 0 else len(candidates)
         target = max(1, int(base * output_percentage))
         max_photos = min(target, len(candidates))
 
+    # Drop bottom fraction by composite score (removes visually meaningless photos).
+    # Done after max_photos so the target isn't shrunk by the filter.
+    if min_score_pct > 0.0 and scores:
+        cand_scores = [scores.get(r["path"], 0.0) for r in candidates]
+        threshold = float(np.percentile(cand_scores, min_score_pct * 100.0))
+        candidates = [r for r in candidates if scores.get(r["path"], 0.0) >= threshold]
+        if not candidates:
+            return []
+        # Clamp max_photos to the surviving candidate count
+        if max_photos is not None:
+            max_photos = min(max_photos, len(candidates))
+
     # ── Derive per-subject caps from the output target ────────────
     cap_base = max_photos if max_photos is not None else len(candidates)
+    target_for_cap = max_photos if max_photos is not None else len(candidates)
+
     max_per_person_n   = max(1, int(cap_base * max_per_person_pct))
     max_per_location_n = max(1, int(cap_base * max_per_location_pct))
+    max_per_cluster_n  = max(1, int(cap_base * max_per_cluster_pct))
+
+    # Only enforce the event-cluster cap when it can't starve the target.
+    distinct_clusters = {
+        r.get("cluster_id", -1) for r in candidates
+        if r.get("cluster_id", -1) >= 0
+    }
+    num_clusters = len(distinct_clusters)
+    enforce_cluster_cap = (
+        num_clusters >= 2
+        and num_clusters * max_per_cluster_n >= target_for_cap
+    )
+
+    # Hour cap: only enforce when total hour capacity covers the target.
+    # With e.g. 20 distinct hours × cap=1 = 20 capacity < 27 target → disabled.
+    # When enforced, raise cap to ceil(target/num_hours) so target is reachable
+    # while still limiting consecutive-hour bursts.
+    if max_per_hour_pct > 0.0:
+        distinct_hours = {
+            int((r.get("timestamp", 0) or 0) / 3600)
+            for r in candidates
+            if (r.get("timestamp", 0) or 0) > 0
+        }
+        num_hours = len(distinct_hours)
+        raw_hour_cap = max(1, int(cap_base * max_per_hour_pct))
+        if num_hours >= 2 and num_hours * raw_hour_cap >= target_for_cap:
+            # Raise cap to at least ceil(target/num_hours) so target is reachable
+            min_needed = max(1, int(np.ceil(target_for_cap / num_hours)))
+            max_per_hour_n: Optional[int] = max(raw_hour_cap, min_needed)
+        else:
+            max_per_hour_n = None  # too few distinct hours — skip cap
+    else:
+        max_per_hour_n = None
 
     # ── Estimate output sizes after resizing ──────────────────────
+    # When resize_output is enabled, photos are re-encoded as JPEG at
+    # output_long_side; a 2560px JPEG q=92 averages ~1.2–1.8 MB regardless
+    # of the source being a 4 MB JPEG or a 24 MB HEIC.  Using the raw
+    # file_size here would trip the byte budget far too early.
     def _est_size(rec: dict) -> int:
         orig = rec.get("file_size", 2_000_000)
-        return min(orig, 5_000_000)
+        if resize_output:
+            # Cap at a realistic resized-JPEG estimate
+            return min(orig, 1_800_000)
+        return min(orig, 8_000_000)
 
     # Sort all candidates by score descending
     sorted_cands = sorted(
@@ -149,6 +212,11 @@ def select_photos(
     selected_paths: Set[str] = set()
     selected: List[dict] = []
     used_bytes: int = 0
+    hour_counts: Dict[int, int] = defaultdict(int)
+
+    def _hour_key(rec: dict) -> int:
+        ts = rec.get("timestamp", 0) or 0
+        return int(ts / 3600) if ts > 0 else -1
 
     def _add(rec: dict) -> bool:
         nonlocal used_bytes
@@ -159,9 +227,18 @@ def select_photos(
             return False
         if max_photos is not None and len(selected) >= max_photos:
             return False
+        # Per-hour temporal diversity cap
+        if max_per_hour_n is not None:
+            hk = _hour_key(rec)
+            if hk >= 0 and hour_counts[hk] >= max_per_hour_n:
+                return False
         selected_paths.add(rec["path"])
         selected.append(rec)
         used_bytes += est
+        if max_per_hour_n is not None:
+            hk = _hour_key(rec)
+            if hk >= 0:
+                hour_counts[hk] += 1
         return True
 
     def _budget_exhausted() -> bool:
@@ -172,6 +249,15 @@ def select_photos(
     # Shared counters — enforced across all buckets
     person_counts: Dict[int, int] = defaultdict(int)
     loc_counts: Dict[int, int] = defaultdict(int)
+    cluster_counts: Dict[int, int] = defaultdict(int)
+
+    def _cluster_capped(cid: int) -> bool:
+        """True if event-cluster cap should block this record."""
+        if not enforce_cluster_cap:
+            return False
+        if cid < 0:
+            return False  # noise/singleton — diversity not meaningful
+        return cluster_counts[cid] >= max_per_cluster_n
 
     # ── Process each bucket in config order ──────────────────────
     # "aesthetic" is always processed last as the catch-all.
@@ -193,6 +279,7 @@ def select_photos(
             _fill_people_bucket(
                 sorted_cands, _add, _budget_exhausted, _est_size,
                 person_counts, max_per_person_n,
+                cluster_counts, _cluster_capped,
                 bucket_byte_budget, bucket_photo_cap,
             )
 
@@ -201,6 +288,7 @@ def select_photos(
                 sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
                 person_counts, max_per_person_n,
                 loc_counts, max_per_location_n,
+                cluster_counts, _cluster_capped,
                 bucket_byte_budget, bucket_photo_cap,
             )
 
@@ -210,6 +298,7 @@ def select_photos(
             _fill_subject_bucket(
                 sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
                 person_counts, max_per_person_n,
+                cluster_counts, _cluster_capped,
                 subj_scores, bucket_byte_budget, bucket_photo_cap,
             )
 
@@ -218,6 +307,7 @@ def select_photos(
         _fill_aesthetic_bucket(
             sorted_cands, selected_paths, _add, _budget_exhausted,
             person_counts, max_per_person_n,
+            cluster_counts, _cluster_capped,
         )
 
     return selected
@@ -230,6 +320,7 @@ def select_photos(
 def _fill_people_bucket(
     sorted_cands, _add, _budget_exhausted, _est_size,
     person_counts, max_per_person_n,
+    cluster_counts, _cluster_capped,
     byte_budget, photo_cap,
 ):
     used = 0
@@ -241,6 +332,9 @@ def _fill_people_bucket(
             continue
         if person_counts[pid] >= max_per_person_n:
             continue
+        cid = rec.get("cluster_id", -1)
+        if _cluster_capped(cid):
+            continue
         if photo_cap is not None and sum(person_counts.values()) >= photo_cap:
             continue
         est = _est_size(rec)
@@ -248,6 +342,7 @@ def _fill_people_bucket(
             continue
         if _add(rec):
             person_counts[pid] += 1
+            cluster_counts[cid] += 1
             used += est
 
 
@@ -255,6 +350,7 @@ def _fill_location_bucket(
     sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
     person_counts, max_per_person_n,
     loc_counts, max_per_location_n,
+    cluster_counts, _cluster_capped,
     byte_budget, photo_cap,
 ):
     used = 0
@@ -267,6 +363,8 @@ def _fill_location_bucket(
         cid = rec.get("cluster_id", -1)
         if loc_counts[cid] >= max_per_location_n:
             continue
+        if _cluster_capped(cid):
+            continue
         pid = rec.get("person_id", -1)
         if pid >= 0 and person_counts[pid] >= max_per_person_n:
             continue
@@ -277,6 +375,7 @@ def _fill_location_bucket(
             continue
         if _add(rec):
             loc_counts[cid] += 1
+            cluster_counts[cid] += 1
             used += est
             bucket_selected += 1
             if pid >= 0:
@@ -286,6 +385,7 @@ def _fill_location_bucket(
 def _fill_subject_bucket(
     sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
     person_counts, max_per_person_n,
+    cluster_counts, _cluster_capped,
     subj_scores, byte_budget, photo_cap,
 ):
     """Fill a CLIP subject bucket.
@@ -313,6 +413,9 @@ def _fill_subject_bucket(
         pid = rec.get("person_id", -1)
         if pid >= 0 and person_counts[pid] >= max_per_person_n:
             continue
+        cid = rec.get("cluster_id", -1)
+        if _cluster_capped(cid):
+            continue
         if photo_cap is not None and bucket_selected >= photo_cap:
             break
         est = _est_size(rec)
@@ -321,6 +424,7 @@ def _fill_subject_bucket(
         if _add(rec):
             used += est
             bucket_selected += 1
+            cluster_counts[cid] += 1
             if pid >= 0:
                 person_counts[pid] += 1
 
@@ -328,8 +432,13 @@ def _fill_subject_bucket(
 def _fill_aesthetic_bucket(
     sorted_cands, selected_paths, _add, _budget_exhausted,
     person_counts, max_per_person_n,
+    cluster_counts, _cluster_capped,
 ):
-    """Aesthetic catch-all — fills remaining budget with highest-scored photos."""
+    """Aesthetic catch-all — fills remaining budget with highest-scored photos.
+
+    Enforces the event-cluster cap so the catch-all cannot collapse all
+    diversity by repeatedly picking top-ranked photos from one event.
+    """
     for rec in sorted_cands:
         if _budget_exhausted():
             break
@@ -338,7 +447,11 @@ def _fill_aesthetic_bucket(
         pid = rec.get("person_id", -1)
         if pid >= 0 and person_counts[pid] >= max_per_person_n:
             continue
+        cid = rec.get("cluster_id", -1)
+        if _cluster_capped(cid):
+            continue
         if _add(rec):
+            cluster_counts[cid] += 1
             if pid >= 0:
                 person_counts[pid] += 1
 
