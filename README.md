@@ -5,36 +5,36 @@ and produces a curated ~1 GB selection. Runs entirely on-device. No cloud upload
 Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
 
 
-## TABLE OF CONTENTS
+## Table of Contents
 
-- [1. QUICK START](#1-quick-start)
-- [2. HIGH LEVEL DESIGN (HLD)](#2-high-level-design-hld)
-  - [2.1  SYSTEM CONTEXT](#21-system-context)
-  - [2.2  COMPONENT MAP](#22-component-map)
-  - [2.3  TECHNOLOGY STACK](#23-technology-stack)
-  - [2.4  DESIGN PRINCIPLES](#24-design-principles)
-- [3. PIPELINE FLOW](#3-pipeline-flow)
-  - [3.1  END-TO-END PIPELINE (9 STAGES)](#31-end-to-end-pipeline-9-stages)
-  - [3.2  SINGLE-PHOTO DATA FLOW](#32-single-photo-data-flow)
-  - [3.3  SELECTION STRATEGY (30 / 30 / 40)](#33-selection-strategy-30-30-40)
-- [4. LOW LEVEL DESIGN (LLD)](#4-low-level-design-lld)
-  - [4.1  MODULE REFERENCE](#41-module-reference)
-  - [4.2  DATABASE SCHEMA](#42-database-schema)
-  - [4.3  RANKING FORMULA](#43-ranking-formula)
-  - [4.4  DEDUPLICATION LOGIC](#44-deduplication-logic)
-  - [4.5  EVENT CLUSTERING ALGORITHM](#45-event-clustering-algorithm)
-  - [4.6  FACE IDENTITY CLUSTERING](#46-face-identity-clustering)
-  - [4.7  PRIVACY FILTER CHAIN](#47-privacy-filter-chain)
-  - [4.8  OUTPUT RESIZING](#48-output-resizing)
-  - [4.9  VECTOR STORE](#49-vector-store)
-- [5. MODULE DEPENDENCY GRAPH](#5-module-dependency-graph)
-- [6. CONFIGURATION REFERENCE](#6-configuration-reference)
-- [7. FILE & DIRECTORY LAYOUT](#7-file-directory-layout)
-- [8. PERFORMANCE & SCALING](#8-performance-scaling)
-- [9. USAGE](#9-usage)
-- [10. TESTING](#10-testing)
+- [1. Quick Start](#1-quick-start)
+- [2. High Level Design (HLD)](#2-high-level-design-hld)
+  - [2.1  System Context](#21-system-context)
+  - [2.2  Component Map](#22-component-map)
+  - [2.3  Technology Stack](#23-technology-stack)
+  - [2.4  Design Principles](#24-design-principles)
+- [3. Pipeline Flow](#3-pipeline-flow)
+  - [3.1  End-to-End Pipeline (9 Stages)](#31-end-to-end-pipeline-9-stages)
+  - [3.2  Single-Photo Data Flow](#32-single-photo-data-flow)
+  - [3.3  Selection Strategy (30 / 30 / 40)](#33-selection-strategy-30-30-40)
+- [4. Low Level Design (LLD)](#4-low-level-design-lld)
+  - [4.1  Module Reference](#41-module-reference)
+  - [4.2  Database Schema](#42-database-schema)
+  - [4.3  Ranking Formula](#43-ranking-formula)
+  - [4.4  Deduplication Logic](#44-deduplication-logic)
+  - [4.5  Event Clustering Algorithm](#45-event-clustering-algorithm)
+  - [4.6  Face Identity Clustering](#46-face-identity-clustering)
+  - [4.7  Privacy Filter Chain](#47-privacy-filter-chain)
+  - [4.8  Output Resizing](#48-output-resizing)
+  - [4.9  Vector Store](#49-vector-store)
+- [5. Module Dependency Graph](#5-module-dependency-graph)
+- [6. Configuration Reference](#6-configuration-reference)
+- [7. File & Directory Layout](#7-file-directory-layout)
+- [8. Performance & Scaling](#8-performance-scaling)
+- [9. Usage](#9-usage)
+- [10. Testing](#10-testing)
 
-## 1. QUICK START
+## 1. Quick Start
 
 **Recommended — one-command setup and run:**
 
@@ -76,11 +76,11 @@ python main.py
 
 
 
-## 2. HIGH LEVEL DESIGN (HLD)
+## 2. High Level Design (HLD)
 
 
 
-### 2.1  SYSTEM CONTEXT
+### 2.1  System Context
 
 
 
@@ -139,7 +139,7 @@ python main.py
 
 
 
-### 2.2  COMPONENT MAP
+### 2.2  Component Map
 
 ```text
   +===========================================================================+
@@ -191,7 +191,7 @@ python main.py
 
 
 
-### 2.3  TECHNOLOGY STACK
+### 2.3  Technology Stack
 
 
 
@@ -217,33 +217,33 @@ python main.py
 
 
 
-### 2.4  DESIGN PRINCIPLES
+### 2.4  Design Principles
 
 
-  INCREMENTAL
+  Incremental
     Every photo is identified by its MD5 hash. On re-run, photos already
     in the SQLite cache are skipped entirely. Only new or changed files
     are processed. A 10,000-photo library with 50 new photos takes seconds
     for stages 1-2 on the second run.
 
-  RESUMABLE
+  Resumable
     All intermediate results are persisted to SQLite after each stage.
     --from-stage N skips all earlier stages and reads the DB state instead.
     Useful for re-tuning config.yaml without repeating ML inference.
 
-  MEMORY-EFFICIENT
+  Memory-Efficient
     Photos are resized to max_dimension (default 1024px) before any ML
     processing. Images are never held in memory across loop iterations.
     Embeddings are stored in ChromaDB (HNSW-indexed on disk) rather than
     loaded wholesale into RAM; stages 6-8 query the store instead of
     deserialising all SQLite BLOBs at once.
 
-  PRIVACY-FIRST
+  Privacy-First
     All processing is local. Privacy filters run before ML scoring so
     sensitive documents never enter the ranking pool. Home-location
     filtering is opt-in via config.yaml.
 
-  SEPARATION OF CONCERNS
+  Separation of Concerns
     Each src/ module has one job. main.py is the only orchestrator.
     No module imports another except through the DB or explicit parameters.
     (Exception: aesthetic.py and scene_tagger.py reuse embeddings.py
@@ -251,15 +251,15 @@ python main.py
 
 
 
-## 3. PIPELINE FLOW
+## 3. Pipeline Flow
 
 
 
-### 3.1  END-TO-END PIPELINE (9 STAGES)
+### 3.1  End-to-End Pipeline (9 Stages)
 
 
-  - **INPUT:** `data/input_photos/**` (JPG, PNG, HEIC, TIFF, WebP, BMP)
-  - **OUTPUT:** `data/output_photos/` (resized JPEG + output.json)
+  - **Input:** `data/input_photos/**` (JPG, PNG, HEIC, TIFF, WebP, BMP)
+  - **Output:** `data/output_photos/` (resized JPEG + output.json)
 
 
 ```text
@@ -382,7 +382,7 @@ python main.py
 
 
 
-### 3.2  SINGLE-PHOTO DATA FLOW
+### 3.2  Single-Photo Data Flow
 
 
 
@@ -474,7 +474,7 @@ python main.py
 
 
 
-### 3.3  SELECTION STRATEGY (30 / 30 / 40)
+### 3.3  Selection Strategy (30 / 30 / 40)
 
 
   Total budget: 1 073 741 824 bytes (1 GB)
@@ -521,17 +521,17 @@ python main.py
 ```
 
 
-  NOTE: Estimated output size uses post-resize bytes, not originals.
+  Note: Estimated output size uses post-resize bytes, not originals.
         A 12 MP original (~4 MB) -> ~1.5 MB after resize = 2.5x more
         photos fit within the 1 GB budget compared to copying originals.
 
 
 
-## 4. LOW LEVEL DESIGN (LLD)
+## 4. Low Level Design (LLD)
 
 
 
-### 4.1  MODULE REFERENCE
+### 4.1  Module Reference
 
 
   src/ingestion.py
@@ -819,10 +819,10 @@ python main.py
 
 
 
-### 4.2  DATABASE SCHEMA
+### 4.2  Database Schema
 
 
-  TABLE: photos
+  Table: photos
 
 
 ```text
@@ -880,7 +880,7 @@ python main.py
 
 
 
-### 4.3  RANKING FORMULA
+### 4.3  Ranking Formula
 
 
   All 7 components are min-max normalised to [0,1] before weighting.
@@ -922,7 +922,7 @@ python main.py
 
 
 
-### 4.4  DEDUPLICATION LOGIC
+### 4.4  Deduplication Logic
 
 
   ANN-accelerated path (default, when ChromaDB store has data):
@@ -969,7 +969,7 @@ python main.py
 
 
 
-### 4.5  EVENT CLUSTERING ALGORITHM
+### 4.5  Event Clustering Algorithm
 
 
   Goal: group photos from the same occasion (trip, party, hike) together.
@@ -1003,7 +1003,7 @@ python main.py
 
 
 
-### 4.6  FACE IDENTITY CLUSTERING
+### 4.6  Face Identity Clustering
 
 
   Goal: identify "Person A" across hundreds of photos without any labelling.
@@ -1036,7 +1036,7 @@ python main.py
 
 
 
-### 4.7  PRIVACY FILTER CHAIN
+### 4.7  Privacy Filter Chain
 
 
   Three checks, ordered cheapest-first:
@@ -1095,7 +1095,7 @@ python main.py
 
 
 
-### 4.8  OUTPUT RESIZING
+### 4.8  Output Resizing
 
 
   Why resize?
@@ -1129,7 +1129,7 @@ python main.py
 
 
 
-### 4.9  VECTOR STORE
+### 4.9  Vector Store
 
 
   ChromaDB is used as a local, server-free HNSW vector database.
@@ -1179,7 +1179,7 @@ python main.py
 
 
 
-## 5. MODULE DEPENDENCY GRAPH
+## 5. Module Dependency Graph
 
 
   Arrows show "imports / calls". database.py and vector_store.py are used
@@ -1233,7 +1233,7 @@ python main.py
 
 
 
-## 6. CONFIGURATION REFERENCE
+## 6. Configuration Reference
 
 
   All settings live in config.yaml. Run python main.py --config my.yaml
@@ -1328,7 +1328,7 @@ python main.py
 
 
 
-## 7. FILE & DIRECTORY LAYOUT
+## 7. File & Directory Layout
 
 ```text
   photo-curator/
@@ -1399,10 +1399,10 @@ python main.py
 
 
 
-## 8. PERFORMANCE & SCALING
+## 8. Performance & Scaling
 
 
-  STAGE TIMING BREAKDOWN (Apple M1, 5 000 photos)
+  Stage Timing Breakdown (Apple M1, 5 000 photos)
 
 
 ```text
@@ -1427,7 +1427,7 @@ python main.py
 ```
 
 
-  LIBRARY SIZE ESTIMATES (Apple M1)
+  Library Size Estimates (Apple M1)
 
 
 ```text
@@ -1441,7 +1441,7 @@ python main.py
 ```
 
 
-  MEMORY USAGE
+  Memory Usage
 
 
 ```text
@@ -1457,7 +1457,7 @@ python main.py
 ```
 
 
-  SPEED-UP TIPS
+  Speed-Up Tips
 
   1. Increase batch_size to 32 if you have > 8 GB RAM.
   2. Set max_dimension: 512 for a 2x speed boost in exchange for
@@ -1471,10 +1471,10 @@ python main.py
 
 
 
-## 9. USAGE
+## 9. Usage
 
 
-  RECOMMENDED — run.sh (handles venv, deps, CLIP, then launches the pipeline)
+  Recommended — run.sh (handles venv, deps, CLIP, then launches the pipeline)
 
 ```bash
     ./run.sh                              # full pipeline, defaults from config.yaml
@@ -1489,7 +1489,7 @@ python main.py
     ./run.sh --reinstall                 # force reinstall all dependencies
 ```
 
-  DIRECT INVOCATION (after venv is active)
+  Direct Invocation (after venv is active)
 
 ```bash
     python main.py
@@ -1499,7 +1499,7 @@ python main.py
     python main.py --config configs/strict.yaml
 ```
 
-  CACHE MANAGEMENT — cleanup.sh
+  Cache Management — cleanup.sh
 
 ```bash
     ./cleanup.sh --cache         # delete SQLite DB + vector store (forces full reprocess)
@@ -1512,7 +1512,7 @@ python main.py
     # flags can be combined: ./cleanup.sh --cache --output --dry-run
 ```
 
-  TESTING
+  Testing
 
 ```bash
     # Install pytest into the project venv first (if not present)
@@ -1525,7 +1525,7 @@ python main.py
     .venv/bin/pytest tests/ --cov=src --cov-report=term-missing
 ```
 
-  TYPICAL TUNING WORKFLOW
+  Typical Tuning Workflow
 
     1. Run full pipeline:  ./run.sh
     2. Review output.json — check scores, scene tags, person IDs
@@ -1533,7 +1533,7 @@ python main.py
     4. Re-run from stage 9:  ./run.sh --no-clean --from-stage 9  (seconds)
     5. Iterate until satisfied
 
-  REQUIREMENTS
+  Requirements
 
     Python 3.10+ (run.sh auto-detects; prefers 3.12)
     macOS with Apple Silicon (MPS), or NVIDIA GPU (CUDA), or CPU fallback
@@ -1551,7 +1551,7 @@ python main.py
 
 
 
-## 10. TESTING
+## 10. Testing
 
 
   The test suite covers all 16 src/ modules with 282 tests.
@@ -1574,7 +1574,7 @@ python main.py
 ```
 
 
-  TEST COVERAGE BY MODULE
+  Test Coverage by Module
 
 ```text
   Test file                  Module tested          Key scenarios
