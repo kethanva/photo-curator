@@ -160,7 +160,7 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                              orig_resolution=orig_shorter)
             clip_emb   = embeddings.extract(img, clip_model, clip_preprocess, clip_device)
             phash_str  = deduplication.compute_phash(img)
-            face_count, face_emb = face_detection.detect(img)
+            face_count, face_emb, face_prominence, face_confidence = face_detection.detect(img)
             is_priv    = privacy.assess(
                 img=img,
                 camera_model=exif["camera_model"],
@@ -195,6 +195,8 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                 "phash": phash_str,
                 "face_count": face_count,
                 "face_emb": database.emb_to_blob(face_emb),
+                "face_prominence": face_prominence,
+                "face_confidence": face_confidence,
                 "is_private": int(is_priv),
                 "processed_at": time.time(),
             })

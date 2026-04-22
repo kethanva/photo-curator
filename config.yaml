@@ -68,18 +68,34 @@ sentiment:
   min_face_for_sentiment: 1  # only run on photos with ≥ N faces
 
 # ── Ranking weights ──────────────────────────────────────────────────────────
-# Base weights do not need to sum to 1.0.
+# Weights sum to 1.0 for interpretability but are not required to.
+# Face-related signals (face_score + face_prominence + face_confidence + sentiment)
+# now total 0.51 — photos with clear, smiling, prominent faces rank highest.
+# Aesthetic weight reduced from 0.35 to 0.20 to prevent landscape/architectural
+# photos from drowning out people photos.
 ranking:
   weights:
-    sharpness:           0.15
-    aesthetic:           0.35   # CLIP / LAION aesthetic score — primary signal
-    face_score:          0.15
-    sentiment:           0.15   # smile + eyes open (MediaPipe)
-    uniqueness:          0.12
+    sharpness:           0.10
+    aesthetic:           0.20   # CLIP / LAION aesthetic score
+    face_score:          0.18   # log-scaled face count
+    face_prominence:     0.10   # face bounding-box area / image area
+    face_confidence:     0.05   # MTCNN detection probability
+    sentiment:           0.18   # smile + eyes open (MediaPipe)
+    uniqueness:          0.10
     metadata_importance: 0.05
-    diversity_bonus:     0.03
+    diversity_bonus:     0.04
 
-# ── Selection — output budget + 30 / 30 / 40 diversity strategy ─────────────
+# ── Face identity clustering ─────────────────────────────────────────────────
+# Tighter eps (0.65 vs default 0.80) reduces false merging of different people.
+# Lower frequent_person_threshold (3 vs default 5) identifies recurring people
+# even in smaller libraries.
+face_clustering:
+  enabled: true
+  eps: 0.65                    # DBSCAN radius — smaller = stricter identity match
+  min_samples: 2               # min photos to form an identity cluster
+  frequent_person_threshold: 3 # min photos for a person to be "frequent"
+
+# ── Selection — output budget + diversity strategy ───────────────────────────
 selection:
   # Output budget mode — choose one:
   #   percentage  → select output_percentage of all eligible photos
@@ -100,17 +116,17 @@ selection:
   #   fashion, art, music, reading, gaming
   # To add a new subject bucket, just add a line — no code changes needed.
   buckets:
-    people:     0.40    # best photos per frequent person
-    location:   0.30    # best photos per GPS cluster
+    people:     0.50    # best photos per frequent person (boosted — face-first)
+    location:   0.20    # best photos per GPS cluster (reduced to limit same-place repetition)
     bike:       0.10    # CLIP-matched cycling/bicycle photos
-    landscape:  0.10    # CLIP-matched scenic landscape photos
-    aesthetic:  0.10    # catch-all: highest overall scores
+    landscape:  0.05    # CLIP-matched scenic landscape photos (reduced)
+    aesthetic:  0.15    # catch-all: highest overall scores
 
   # Per-bucket caps — fraction of the output target (0.0 – 1.0)
-  # Example: 50 output photos → 0.10 = 5, 0.30 = 15, 0.20 = 10
-  max_per_person_pct:   0.25   # max share of output for any single identified person
-  max_per_location_pct: 0.25   # max share of output from any single GPS cluster
-  max_per_cluster_pct:  0.12   # event-cluster cap (backup diversity guard)
+  # Example: 20 output photos → 0.15 = 3, 0.06 = 1-2
+  max_per_person_pct:   0.20   # max share of output for any single identified person
+  max_per_location_pct: 0.15   # max share from any single GPS/event cluster (was 0.25)
+  max_per_cluster_pct:  0.08   # event-cluster cap — tighter to prevent same-event pileup
   max_per_hour_pct:     0.05   # max share from any single calendar hour (temporal spread)
   min_score_pct:        0.15   # drop bottom 15% of photos by composite score
 
