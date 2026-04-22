@@ -118,16 +118,23 @@ class TestScorePhotos:
         result = score_photos(recs, weights)
         assert result["sharp.jpg"] > result["blurry.jpg"]
 
-    def test_duplicate_penalised(self):
+    def test_uniqueness_rewards_small_clusters(self):
+        """Uniqueness now reflects inverse event-cluster density.
+
+        Duplicate filtering happens upstream — the ranking pool never contains
+        photos with is_duplicate=1, so the old "penalise duplicates" weight was
+        a no-op.  The new semantics: a photo that's the only one in its event
+        cluster scores higher than one of 20 photos from the same wedding.
+        """
         weights = {"sharpness": 0.0, "aesthetic": 0.0, "face_score": 0.0,
                    "sentiment": 0.0, "uniqueness": 1.0, "metadata_importance": 0.0,
                    "diversity_bonus": 0.0}
-        recs = [
-            _make_record("orig.jpg", is_dup=0),
-            _make_record("dup.jpg", is_dup=1),
+        # 1 solo photo vs 5 photos from the same event
+        recs = [_make_record("solo.jpg", cluster_id=0)] + [
+            _make_record(f"crowd{i}.jpg", cluster_id=1) for i in range(5)
         ]
         result = score_photos(recs, weights)
-        assert result["orig.jpg"] > result["dup.jpg"]
+        assert result["solo.jpg"] > result["crowd0.jpg"]
 
     def test_single_record_scores(self):
         """Single photo should still produce a score."""
