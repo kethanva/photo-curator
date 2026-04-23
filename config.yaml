@@ -130,6 +130,7 @@ selection:
   max_per_day_pct:      0.15   # NEW: max share from any single calendar day (strongest temporal guard)
                                # e.g. 20-photo output → max 3 photos per shooting day
   max_per_hour_pct:     0.05   # max share from any single calendar hour
+  min_spacing_seconds:  600    # NEW: strict minimum time gap between photos in the same event
   min_score_pct:        0.15   # drop bottom 15% of photos by composite score
 
   # Output resizing — dramatically increases photos that fit in budget
