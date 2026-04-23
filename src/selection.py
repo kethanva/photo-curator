@@ -88,7 +88,7 @@ def select_photos(
     output_percentage: float = 0.15,
     total_photos: int = 0,
     resize_output: bool = True,
-    min_spacing_seconds: int = 0,
+    max_dynamic_spacing: float = 600.0,
 ) -> List[dict]:
     """
     Select photos using a dynamic bucket diversity strategy.
@@ -172,6 +172,39 @@ def select_photos(
     max_per_location_n = max(1, int(np.ceil(cap_base * max_per_location_pct)))
     max_per_cluster_n  = max(1, int(np.ceil(cap_base * max_per_cluster_pct)))
 
+    # ── Dynamic Temporal Spacing ──────────────────────────────────
+    global_selectivity = max_photos / max(1, len(candidates)) if max_photos else output_percentage
+
+    cluster_stats = {}
+    for r in candidates:
+        cid = r.get("cluster_id", -1)
+        ts = r.get("timestamp", 0)
+        if cid >= 0 and ts > 0:
+            if cid not in cluster_stats:
+                cluster_stats[cid] = {"min_ts": ts, "max_ts": ts, "count": 0}
+            else:
+                if ts < cluster_stats[cid]["min_ts"]: cluster_stats[cid]["min_ts"] = ts
+                if ts > cluster_stats[cid]["max_ts"]: cluster_stats[cid]["max_ts"] = ts
+            cluster_stats[cid]["count"] += 1
+
+    cluster_dynamic_spacing = {}
+    for cid, stats in cluster_stats.items():
+        duration = stats["max_ts"] - stats["min_ts"]
+        if duration <= 0 or stats["count"] < 2:
+            cluster_dynamic_spacing[cid] = 0.0
+            continue
+            
+        expected_n = stats["count"] * global_selectivity
+        allowed_n = min(stats["count"], max_per_cluster_n)
+        target_n = max(2.0, (expected_n + allowed_n) / 2.0)
+        
+        avg_gap = duration / target_n
+        spacing_factor = max(0.1, min(0.6, 1.0 - global_selectivity))
+        dynamic_sec = avg_gap * spacing_factor
+        
+        absolute_floor = 15.0
+        cluster_dynamic_spacing[cid] = min(float(max_dynamic_spacing), max(absolute_floor, dynamic_sec))
+
     def _day_key(rec: dict) -> int:
         """Local-time calendar day. Photos missing a timestamp share bucket -1
         so they cannot pile up unnoticed."""
@@ -237,15 +270,17 @@ def select_photos(
         if rec["path"] in selected_paths:
             return False
 
-        # Check temporal spacing within the same event cluster
+        # Check dynamic temporal spacing within the same event cluster
         ts = rec.get("timestamp", 0) or 0
-        if min_spacing_seconds > 0 and ts > 0:
-            cid = rec.get("cluster_id", -1)
-            if cid >= 0:
+        cid = rec.get("cluster_id", -1)
+        
+        if ts > 0 and cid >= 0:
+            req_spacing = cluster_dynamic_spacing.get(cid, 0.0)
+            if req_spacing > 0:
                 for sel_rec in selected:
                     if sel_rec.get("cluster_id", -1) == cid:
                         sel_ts = sel_rec.get("timestamp", 0) or 0
-                        if sel_ts > 0 and abs(ts - sel_ts) < min_spacing_seconds:
+                        if sel_ts > 0 and abs(ts - sel_ts) < req_spacing:
                             return False
 
         est = _est_size(rec)

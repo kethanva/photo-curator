@@ -506,6 +506,7 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: 
         max_per_location_pct=sel_cfg.get("max_per_location_pct", 0.30),
         max_per_day_pct=sel_cfg.get("max_per_day_pct", 0.15),
         max_per_hour_pct=sel_cfg.get("max_per_hour_pct", 0.05),
+        max_dynamic_spacing=sel_cfg.get("max_dynamic_spacing", 600),
         min_score_pct=sel_cfg.get("min_score_pct", 0.0),
         buckets=bucket_cfg,
         subject_scores=bucket_subject_scores,
