@@ -34,6 +34,8 @@ privacy:
   filter_screenshots: true
   filter_documents: true      # CLIP zero-shot doc / ID / meme / text-overlay detection
   filter_text_heavy: true     # binary CLIP check for chat screenshots / text-only images saved with camera filenames
+  filter_boring_objects: true # filter out mundane photos like tubelights, doors, windows, walls
+  filter_intimate_content: true # filter out intimate or highly private photos of people
   filter_home_private: false  # enable to filter solo shots at home
   home_coords: null           # [lat, lon] or null
   home_radius_km: 0.5

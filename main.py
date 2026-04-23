@@ -140,7 +140,7 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
     processed = skipped = 0
 
     with database.connect(db_path) as conn:
-        for path in tqdm(paths, desc="  Extracting", unit="img"):
+        for path in tqdm(paths, desc="  Extracting", unit="img", dynamic_ncols=True):
             path_str  = str(path)
             file_hash = ingestion.compute_file_hash(path)
 
@@ -172,6 +172,8 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                 filter_screenshots=p_cfg["filter_screenshots"],
                 filter_documents=p_cfg["filter_documents"],
                 filter_text_heavy=p_cfg.get("filter_text_heavy", True),
+                filter_boring_objects=p_cfg.get("filter_boring_objects", True),
+                filter_intimate_content=p_cfg.get("filter_intimate_content", True),
                 filter_home_private=p_cfg["filter_home_private"],
                 filter_reshared=p_cfg.get("filter_reshared", True),
                 reshared_prefixes=p_cfg.get("reshared_prefixes"),
@@ -266,6 +268,7 @@ def stage_sentiment(cfg: dict, db_path: str, paths) -> None:
             [p for p in paths if str(p) in path_to_row],
             desc="  Sentiment",
             unit="img",
+            dynamic_ncols=True,
         ):
             img, _ = ingestion.load_image_safe(path, max_dim)
             if img is None:
@@ -292,6 +295,8 @@ def stage_reassess_privacy(cfg: dict, db_path: str) -> None:
             filter_reshared=p_cfg.get("filter_reshared", True),
             reshared_prefixes=p_cfg.get("reshared_prefixes"),
             filter_text_heavy=p_cfg.get("filter_text_heavy", True),
+            filter_boring_objects=p_cfg.get("filter_boring_objects", True),
+            filter_intimate_content=p_cfg.get("filter_intimate_content", True),
         )
     print(f"  Privacy re-assessed: {total} photos, {changed} updated")
 
