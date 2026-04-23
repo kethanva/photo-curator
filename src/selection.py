@@ -89,6 +89,8 @@ def select_photos(
     total_photos: int = 0,
     resize_output: bool = True,
     max_dynamic_spacing: float = 600.0,
+    output_long_side: int = 2560,
+    output_jpeg_quality: int = 92,
 ) -> List[dict]:
     """
     Select photos using a dynamic bucket diversity strategy.
@@ -244,15 +246,22 @@ def select_photos(
             max_per_hour_n = max(1, int(np.ceil(cap_base * max_per_hour_pct)))
 
     # ── Estimate output sizes after resizing ──────────────────────
-    # When resize_output is enabled, photos are re-encoded as JPEG at
-    # output_long_side; a 2560px JPEG q=92 averages ~1.2–1.8 MB regardless
-    # of the source being a 4 MB JPEG or a 24 MB HEIC.  Using the raw
-    # file_size here would trip the byte budget far too early.
+    # Dynamically estimate output JPEG size based on requested resolution and quality.
     def _est_size(rec: dict) -> int:
         orig = rec.get("file_size", 2_000_000)
         if resize_output:
-            # Cap at a realistic resized-JPEG estimate
-            return min(orig, 1_800_000)
+            # Dynamically estimate bits per pixel based on JPEG quality
+            if output_jpeg_quality >= 95: bpp = 3.5
+            elif output_jpeg_quality >= 90: bpp = 2.5
+            elif output_jpeg_quality >= 85: bpp = 1.5
+            elif output_jpeg_quality >= 75: bpp = 1.0
+            else: bpp = 0.5
+            
+            # Assume average 4:3 aspect ratio
+            pixels = output_long_side * (output_long_side * 0.75)
+            estimated_bytes = int((pixels * bpp) / 8.0)
+            
+            return min(orig, estimated_bytes)
         return min(orig, 8_000_000)
 
     # Sort all candidates by score descending
