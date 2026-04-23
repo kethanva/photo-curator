@@ -27,11 +27,10 @@ Stage 8  Clustering      — DBSCAN event clustering + DBSCAN face identity clus
 Stage 9  Selection       — 30/30/40 strategy → copy to output + report
 ```
 
-### Selection Strategy (30 / 30 / 40)
+### Dynamic Bucket Selection Strategy
 
-- **30%** — Top-ranked singles (best quality score per unique scene)
-- **30%** — Event diversity (one best photo per cluster/event)
-- **40%** — People diversity (faces, identities, compositions)
+- **Subject Buckets** (Configurable in config.yaml, e.g. People, Location, Bike, Landscape) — Allocates budget fraction to best photos matching these subjects, respecting strict diversity caps (e.g. `max_per_person_pct`).
+- **Aesthetic Bucket** (Final Catch-All) — Absorbs all remaining unused budget and selects the highest-scoring photos across the entire library to ensure the requested output quota is met.
 
 ### Technology Stack
 
@@ -119,9 +118,9 @@ Key tuneable parameters:
 - `dedup.clip_threshold` — cosine similarity threshold
 - `quality.blur_threshold` — Laplacian variance cutoff
 - `clustering.eps` / `clustering.min_samples` — DBSCAN parameters
-- `selection.top_singles_ratio` — 30% singles weight
-- `selection.event_diversity_ratio` — 30% event weight
-- `selection.people_diversity_ratio` — 40% people weight
+- `selection.buckets` — Dynamic percentage allocation mapping for subjects (e.g., people, location, aesthetic)
+- `selection.max_per_person_pct` — Diversity cap for a single person
+- `selection.max_per_day_pct` — Diversity cap for a single shooting day
 
 ---
 

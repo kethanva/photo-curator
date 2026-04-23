@@ -139,6 +139,25 @@ def select_photos(
     if not candidates:
         return []
 
+    # ── Estimate output sizes after resizing ──────────────────────
+    # Dynamically estimate output JPEG size based on requested resolution and quality.
+    def _est_size(rec: dict) -> int:
+        orig = rec.get("file_size") or 2_000_000
+        if resize_output:
+            # Dynamically estimate bits per pixel based on JPEG quality
+            if output_jpeg_quality >= 95: bpp = 3.5
+            elif output_jpeg_quality >= 90: bpp = 2.5
+            elif output_jpeg_quality >= 85: bpp = 1.5
+            elif output_jpeg_quality >= 75: bpp = 1.0
+            else: bpp = 0.5
+            
+            # Assume average 4:3 aspect ratio
+            pixels = output_long_side * (output_long_side * 0.75)
+            estimated_bytes = int((pixels * bpp) / 8.0)
+            
+            return min(orig, estimated_bytes)
+        return min(orig, 8_000_000)
+
     # Derive photo count target for percentage mode BEFORE score filtering,
     # so the target reflects the eligible pool size, not the post-filter remainder.
     max_photos: Optional[int] = None
@@ -160,8 +179,15 @@ def select_photos(
             max_photos = min(max_photos, len(candidates))
 
     # ── Derive per-subject caps from the output target ────────────
-    cap_base = max_photos if max_photos is not None else len(candidates)
-    target_for_cap = max_photos if max_photos is not None else len(candidates)
+    if max_photos is not None:
+        cap_base = max_photos
+        target_for_selectivity = max_photos
+    else:
+        # Bytes mode estimation for better selectivity and diversity caps
+        avg_size = sum(_est_size(r) for r in candidates) / len(candidates) if candidates else 2_000_000
+        est_count = int(max_bytes / max(1, avg_size))
+        cap_base = min(len(candidates), est_count)
+        target_for_selectivity = cap_base
 
     # All diversity caps below are STRICT — no auto-raise. Previously the
     # cluster and hour caps silently relaxed themselves to ceil(target/buckets)
@@ -175,7 +201,7 @@ def select_photos(
     max_per_cluster_n  = max(1, int(np.ceil(cap_base * max_per_cluster_pct)))
 
     # ── Dynamic Temporal Spacing ──────────────────────────────────
-    global_selectivity = max_photos / max(1, len(candidates)) if max_photos else output_percentage
+    global_selectivity = target_for_selectivity / max(1, len(candidates))
 
     cluster_stats = {}
     for r in candidates:
@@ -191,36 +217,48 @@ def select_photos(
 
     cluster_dynamic_spacing = {}
     for cid, stats in cluster_stats.items():
-        duration = stats["max_ts"] - stats["min_ts"]
-        if duration <= 0 or stats["count"] < 2:
+        if stats["count"] < 2:
             cluster_dynamic_spacing[cid] = 0.0
             continue
             
+        duration = stats["max_ts"] - stats["min_ts"]
+            
+        # Target number of photos is constrained by the actual event duration.
+        # This prevents "bursts" (high count, short duration) from yielding tiny gaps.
+        # Assume a dense event justifies 1 photo per 120 seconds.
+        duration_based_n = max(0.5, duration / 120.0)
+        
         expected_n = stats["count"] * global_selectivity
-        allowed_n = min(stats["count"], max_per_cluster_n)
-        target_n = max(2.0, (expected_n + allowed_n) / 2.0)
         
-        avg_gap = duration / target_n
-        spacing_factor = max(0.1, min(0.6, 1.0 - global_selectivity))
-        dynamic_sec = avg_gap * spacing_factor
+        # Target N is bounded by duration to aggressively squash bursts
+        target_n = min(expected_n, duration_based_n, max_per_cluster_n)
         
-        absolute_floor = 15.0
+        if target_n <= 1.0:
+            # Event is too short/sparse to justify multiple photos. Force massive gap.
+            dynamic_sec = float('inf')
+        else:
+            avg_gap = duration / target_n
+            # Allow some wiggle room (0.6x) so they don't have to be perfectly evenly spaced
+            dynamic_sec = avg_gap * 0.6
+        
+        # Absolute floor increased to 60s to prevent back-to-back similar shots
+        absolute_floor = 60.0
         cluster_dynamic_spacing[cid] = min(float(max_dynamic_spacing), max(absolute_floor, dynamic_sec))
 
     def _day_key(rec: dict) -> int:
-        """Local-time calendar day. Photos missing a timestamp share bucket -1
-        so they cannot pile up unnoticed."""
+        """Local-time calendar day. Photos missing a timestamp get a unique negative ID
+        so they don't incorrectly pool together and get throttled."""
         ts = rec.get("timestamp", 0) or 0
         if ts <= 0:
-            return -1
+            return -abs(hash(rec["path"])) - 1
         lt = time.localtime(ts)
         return lt.tm_year * 1000 + lt.tm_yday
 
     def _hour_key(rec: dict) -> int:
-        """Local-time calendar hour. Missing-timestamp photos pool under -1."""
+        """Local-time calendar hour. Missing-timestamp photos get unique negative IDs."""
         ts = rec.get("timestamp", 0) or 0
         if ts <= 0:
-            return -1
+            return -abs(hash(rec["path"])) - 1
         lt = time.localtime(ts)
         return lt.tm_year * 1_000_000 + lt.tm_yday * 100 + lt.tm_hour
 
@@ -244,25 +282,6 @@ def select_photos(
         distinct_hours = {_hour_key(r) for r in candidates}
         if len(distinct_hours) >= 2:
             max_per_hour_n = max(1, int(np.ceil(cap_base * max_per_hour_pct)))
-
-    # ── Estimate output sizes after resizing ──────────────────────
-    # Dynamically estimate output JPEG size based on requested resolution and quality.
-    def _est_size(rec: dict) -> int:
-        orig = rec.get("file_size", 2_000_000)
-        if resize_output:
-            # Dynamically estimate bits per pixel based on JPEG quality
-            if output_jpeg_quality >= 95: bpp = 3.5
-            elif output_jpeg_quality >= 90: bpp = 2.5
-            elif output_jpeg_quality >= 85: bpp = 1.5
-            elif output_jpeg_quality >= 75: bpp = 1.0
-            else: bpp = 0.5
-            
-            # Assume average 4:3 aspect ratio
-            pixels = output_long_side * (output_long_side * 0.75)
-            estimated_bytes = int((pixels * bpp) / 8.0)
-            
-            return min(orig, estimated_bytes)
-        return min(orig, 8_000_000)
 
     # Sort all candidates by score descending
     sorted_cands = sorted(
@@ -377,14 +396,13 @@ def select_photos(
             )
 
     # ── Aesthetic share (always last) ────────────────────────────
-    # Respects aesthetic_fraction as a real share, not "all leftover".
-    # Other buckets that undershot their share leave budget on the table —
-    # consistent with the strict-cap philosophy. The undershoot warning
-    # below makes that visible.
+    # Aesthetic bucket takes its own fraction PLUS any unused budget from previous buckets.
+    # This ensures we hit the requested target max_photos / max_bytes if possible,
+    # rather than artificially under-delivering just because earlier buckets were sparse.
     if aesthetic_fraction > 0 and not _budget_exhausted():
-        aesthetic_byte_budget = int(max_bytes * aesthetic_fraction)
+        aesthetic_byte_budget = max_bytes - used_bytes
         aesthetic_photo_cap = (
-            max(1, int(max_photos * aesthetic_fraction))
+            max(1, max_photos - len(selected))
             if max_photos is not None else None
         )
         _fill_aesthetic_bucket(
@@ -467,7 +485,7 @@ def _fill_location_bucket(
         if rec["path"] in selected_paths:
             continue
         cid = rec.get("cluster_id", -1)
-        if loc_counts[cid] >= max_per_location_n:
+        if cid >= 0 and loc_counts[cid] >= max_per_location_n:
             continue
         if _cluster_capped(cid):
             continue
@@ -543,7 +561,7 @@ def _fill_aesthetic_bucket(
     max_per_day_n, max_per_hour_n,
     byte_budget, photo_cap,
 ):
-    """Aesthetic share — fills its configured byte/photo share with the
+    """Aesthetic share — fills the remaining byte/photo budget with the
     highest-scored remaining candidates.
 
     Enforces every diversity cap (person, cluster, day, hour) before the
@@ -616,6 +634,7 @@ def copy_to_output(
     report: List[dict] = []
     copied = 0
     total_bytes = 0
+    collision_counts: Dict[str, int] = defaultdict(int)
 
     for rec in selected:
         src = Path(rec["path"])
@@ -626,10 +645,14 @@ def copy_to_output(
         dst = out / f"{stem}{suffix}"
 
         # Resolve collisions
-        counter = 1
-        while dst.exists():
-            dst = out / f"{stem}__{src.parent.name}_{counter}{suffix}"
-            counter += 1
+        if dst.exists():
+            base_key = f"{stem}__{src.parent.name}"
+            counter = collision_counts[base_key] + 1
+            dst = out / f"{base_key}_{counter}{suffix}"
+            while dst.exists():
+                counter += 1
+                dst = out / f"{base_key}_{counter}{suffix}"
+            collision_counts[base_key] = counter
 
         if resize:
             ok = _resize_and_save(src, dst, long_side, jpeg_quality)

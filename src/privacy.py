@@ -139,7 +139,7 @@ def _get_text_heavy_features():
 
 def is_text_heavy_from_embedding(
     clip_emb: Optional[np.ndarray],
-    threshold: float = 0.60,
+    threshold: float = 0.50,
 ) -> bool:
     """
     Binary CLIP check: True when the image looks like a screenshot or text-only image.
@@ -161,6 +161,133 @@ def is_text_heavy_from_embedding(
         logits = (image_tensor @ text_feats.T * 100.0).softmax(dim=-1)
         text_prob = float(logits[0, 0].item())
         return text_prob >= threshold
+    except Exception:
+        return False
+
+# ---------------------------------------------------------------------------
+# Boring Objects Detection
+# ---------------------------------------------------------------------------
+
+_BORING_PROMPTS = [
+    "a photo of a ceiling light or tubelight",
+    "a mundane photo of a door or window",
+    "a close up of a blank wall",
+    "a blurry or accidental photo of the floor or carpet",
+    "an uninteresting photo of an empty room corner",
+]
+
+_boring_features = None
+_boring_loaded = False
+
+def _get_boring_features():
+    """Encode boring object prompts once and cache them."""
+    global _boring_features, _boring_loaded
+    import torch
+    import clip
+    from src.embeddings import load_model
+
+    model, preprocess, device = load_model()
+
+    if not _boring_loaded:
+        prompts = _BORING_PROMPTS + [_NORMAL_PROMPT]
+        tokens = clip.tokenize(prompts).to(device)
+        with torch.no_grad():
+            feats = model.encode_text(tokens)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        _boring_features = feats
+        _boring_loaded = True
+
+    return _boring_features, model, preprocess, device
+
+def is_boring_from_embedding(
+    clip_emb: Optional[np.ndarray],
+    threshold: float = 0.20,
+    ratio: float = 2.0,
+) -> bool:
+    """
+    CLIP check: True when image looks like a mundane single object (door, tubelight, wall).
+    """
+    if clip_emb is None:
+        return False
+    try:
+        import torch
+
+        text_feats, _, _, device = _get_boring_features()
+        image_tensor = torch.tensor(clip_emb, device=device).unsqueeze(0)
+        image_tensor = image_tensor / image_tensor.norm(dim=-1, keepdim=True)
+        logits = (image_tensor @ text_feats.T * 100.0).softmax(dim=-1)
+        probs = logits.cpu().numpy()[0]
+        
+        normal_prob = float(probs[-1])
+        best_boring = float(probs[:-1].max())
+        
+        if best_boring <= threshold:
+            return False
+        return best_boring >= ratio * max(normal_prob, 1e-6)
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Intimate Content Detection
+# ---------------------------------------------------------------------------
+
+_INTIMATE_PROMPTS = [
+    "a highly private or intimate photo of a person",
+    "a nude or partially nude photo of a man or woman",
+    "a sexually explicit or inappropriate photo",
+    "a photo of someone in their underwear or swimsuit indoors",
+    "a suggestive or revealing photo",
+]
+
+_intimate_features = None
+_intimate_loaded = False
+
+def _get_intimate_features():
+    """Encode intimate object prompts once and cache them."""
+    global _intimate_features, _intimate_loaded
+    import torch
+    import clip
+    from src.embeddings import load_model
+
+    model, preprocess, device = load_model()
+
+    if not _intimate_loaded:
+        prompts = _INTIMATE_PROMPTS + [_NORMAL_PROMPT]
+        tokens = clip.tokenize(prompts).to(device)
+        with torch.no_grad():
+            feats = model.encode_text(tokens)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        _intimate_features = feats
+        _intimate_loaded = True
+
+    return _intimate_features, model, preprocess, device
+
+def is_intimate_from_embedding(
+    clip_emb: Optional[np.ndarray],
+    threshold: float = 0.20,
+    ratio: float = 2.0,
+) -> bool:
+    """
+    CLIP check: True when image looks like intimate/NSFW content.
+    """
+    if clip_emb is None:
+        return False
+    try:
+        import torch
+
+        text_feats, _, _, device = _get_intimate_features()
+        image_tensor = torch.tensor(clip_emb, device=device).unsqueeze(0)
+        image_tensor = image_tensor / image_tensor.norm(dim=-1, keepdim=True)
+        logits = (image_tensor @ text_feats.T * 100.0).softmax(dim=-1)
+        probs = logits.cpu().numpy()[0]
+        
+        normal_prob = float(probs[-1])
+        best_intimate = float(probs[:-1].max())
+        
+        if best_intimate <= threshold:
+            return False
+        return best_intimate >= ratio * max(normal_prob, 1e-6)
     except Exception:
         return False
 
@@ -214,7 +341,7 @@ def _is_private_from_probs(
     return best_private >= ratio * max(normal_prob, 1e-6)
 
 
-def is_document_clip(img: Image.Image, threshold: float = 0.50) -> bool:
+def is_document_clip(img: Image.Image, threshold: float = 0.20) -> bool:
     """CLIP zero-shot: True when image looks like a document / private item."""
     try:
         from src.embeddings import load_model, extract
@@ -231,7 +358,7 @@ def is_document_clip(img: Image.Image, threshold: float = 0.50) -> bool:
 
 def is_document_from_embedding(
     clip_emb: Optional[np.ndarray],
-    threshold: float = 0.50,
+    threshold: float = 0.20,
 ) -> bool:
     """
     CLIP zero-shot privacy check from a pre-computed embedding.
@@ -296,6 +423,8 @@ def reassess_is_private_from_cache(
     reshared_prefixes: Optional[Iterable[str]] = None,
     threshold: float = 0.50,
     filter_text_heavy: bool = True,
+    filter_boring_objects: bool = True,
+    filter_intimate_content: bool = True,
 ) -> Tuple[int, int]:
     """
     Recompute is_private for every cached photo using only the stored CLIP
@@ -336,22 +465,32 @@ def reassess_is_private_from_cache(
             filter_text_heavy and is_text_heavy_from_embedding(clip_emb)
             if clip_emb is not None else False
         )
-        new_flag = int(doc_hit or reshared_hit or text_hit)
+        boring_hit = (
+            filter_boring_objects and is_boring_from_embedding(clip_emb)
+            if clip_emb is not None else False
+        )
+        intimate_hit = (
+            filter_intimate_content and is_intimate_from_embedding(clip_emb)
+            if clip_emb is not None else False
+        )
+        new_flag = int(doc_hit or reshared_hit or text_hit or boring_hit or intimate_hit)
 
         # We only reassess photos whose prior is_private was set by the
         # (now-fixed) CLIP doc logic.  If the screenshot heuristic set
         # it True, that flag is independent and should be recomputed
         # separately — not in scope here.  Simplest honest rule: take
         # the logical OR of prior non-CLIP reasons + new CLIP/filename
-        # reasons.  Since we can't cleanly distinguish prior reasons,
-        # we update only when new_flag differs and the photo has a
-        # cached embedding we trust.
+        # reasons.  
+        # Since we can't cleanly distinguish prior reasons, we assume a 
+        # previous True must be respected (logical OR).
         if clip_emb is None:
             continue
-        if new_flag != prev:
+        
+        final_flag = int(prev or new_flag)
+        if final_flag != prev:
             conn.execute(
                 "UPDATE photos SET is_private=? WHERE path=?",
-                (new_flag, path),
+                (final_flag, path),
             )
             changed += 1
 
@@ -407,6 +546,8 @@ def assess(
     filter_screenshots: bool = True,
     filter_documents: bool = True,
     filter_text_heavy: bool = True,
+    filter_boring_objects: bool = True,
+    filter_intimate_content: bool = True,
     filter_home_private: bool = False,
     filter_reshared: bool = True,
     path: Optional[Union[str, Path]] = None,
@@ -436,5 +577,13 @@ def assess(
     # that slip past the multi-class document detector due to probability dilution.
     if filter_text_heavy and clip_emb is not None:
         if is_text_heavy_from_embedding(clip_emb):
+            return True
+    # Boring objects filter
+    if filter_boring_objects and clip_emb is not None:
+        if is_boring_from_embedding(clip_emb):
+            return True
+    # Intimate content filter
+    if filter_intimate_content and clip_emb is not None:
+        if is_intimate_from_embedding(clip_emb):
             return True
     return False

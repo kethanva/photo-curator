@@ -16,7 +16,7 @@ Optimised for Apple Silicon (M1/M2/M3) via MPS acceleration.
 - [3. Pipeline Flow](#3-pipeline-flow)
   - [3.1  End-to-End Pipeline (9 Stages)](#31-end-to-end-pipeline-9-stages)
   - [3.2  Single-Photo Data Flow](#32-single-photo-data-flow)
-  - [3.3  Selection Strategy (30 / 30 / 40)](#33-selection-strategy-30-30-40)
+  - [3.3  Dynamic Bucket Selection Strategy](#33-dynamic-bucket-selection-strategy)
 - [4. Low Level Design (LLD)](#4-low-level-design-lld)
   - [4.1  Module Reference](#41-module-reference)
   - [4.2  Database Schema](#42-database-schema)
@@ -367,7 +367,7 @@ python main.py
       v
   +---+----------------------------------------------------------+
   | STAGE 9b: SELECTION + OUTPUT              selection.py      |
-  |  - 30/30/40 three-bucket strategy (see section 3.3)         |
+  |  - Dynamic bucket strategy (config.yaml)                    |
   |  - Resizes each selected photo to 2560px long side          |
   |  - Saves as JPEG quality 92                                 |
   |  - Writes output.json report                                |
@@ -474,10 +474,10 @@ python main.py
 
 
 
-### 3.3  Selection Strategy (30 / 30 / 40)
+### 3.3  Dynamic Bucket Selection Strategy
 
 
-  Total budget: 1 073 741 824 bytes (1 GB)
+  Total budget: 1 073 741 824 bytes (1 GB) (example)
 
   Pre-filter: quality_pass=1, is_duplicate=0, is_private=0
   Sort all candidates by score DESC
@@ -493,23 +493,25 @@ python main.py
               |                   |                   |
               v                   v                   v
   +-----------+------+  +---------+--------+  +-------+---------+
-  | BUCKET 1         |  | BUCKET 2         |  | BUCKET 3        |
-  | People  (30%)    |  | Location (30%)   |  | Aesthetic (40%) |
+  | BUCKET 1         |  | BUCKET 2         |  | FINAL BUCKET    |
+  | Configured       |  | Configured       |  | Aesthetic       |
+  | Subject (e.g.    |  | Subject (e.g.    |  | (Catch-all)     |
+  | People 50%)      |  | Location 20%)    |  | (Remaining %)   |
   |                  |  |                  |  |                 |
-  | For each person  |  | For each event   |  | Highest score   |
-  | with is_frequent |  | cluster (GPS)    |  | regardless of   |
-  | take top N       |  | take top M       |  | subject or      |
-  | (max 5 per       |  | (max 15 per      |  | person          |
-  |  person)         |  |  cluster)        |  |                 |
-  | Budget: 300 MB   |  | Budget: 300 MB   |  | Budget: 400 MB  |
+  | Fills up to      |  | Fills up to      |  | Fills the rest  |
+  | 50% of the target|  | 20% of target    |  | of the budget,  |
+  | budget, strictly |  | budget, strictly |  | absorbing any   |
+  | respecting caps  |  | respecting caps  |  | unused budget   |
+  | (e.g. person cap)|  | (e.g. location   |  | from prior      |
+  |                  |  |  cap)            |  | buckets.        |
   +------------------+  +------------------+  +-----------------+
               |                   |                   |
               +-------------------+-------------------+
                                   |
                          Deduplicate across
-                         the three buckets
+                         the buckets dynamically
                          (a photo can qualify
-                          for all three but
+                          for all but
                           is only copied once)
                                   |
                                   v
@@ -789,7 +791,7 @@ python main.py
   src/selection.py
   ----------------
   select_photos(records, scores, ...) -> List[dict]
-    Three-bucket strategy. See section 3.3.
+    Dynamic bucket strategy (configured via config.yaml).
     _est_size(rec): estimates post-resize JPEG size for budget math.
       est = orig_size * (long_side / max_orig_dim)^2 * 0.75
 

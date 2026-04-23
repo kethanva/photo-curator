@@ -42,7 +42,12 @@ def _build_feature_matrix(
         ts = r.get("timestamp", 0.0)
         # Absolute scaling: 1 unit = 1 hour (3600 seconds)
         # Subtract min_ts to prevent float32 precision loss on large Unix timestamps
-        scalars[i, 0] = ((ts - min_ts) / 3600.0) * time_weight if ts > 0 else 0.0
+        if ts > 0:
+            scalars[i, 0] = ((ts - min_ts) / 3600.0) * time_weight
+        else:
+            # Place photos missing timestamps infinitely far apart
+            # so they never cluster based on time (singletons)
+            scalars[i, 0] = 1_000_000.0 + (i * 100.0)
         
         # Absolute spatial scaling: 1 unit = 0.01 degrees (~1.1 km)
         scalars[i, 1] = (r.get("lat", 0.0) * 100.0) * gps_weight
