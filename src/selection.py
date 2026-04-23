@@ -88,6 +88,7 @@ def select_photos(
     output_percentage: float = 0.15,
     total_photos: int = 0,
     resize_output: bool = True,
+    min_spacing_seconds: int = 0,
 ) -> List[dict]:
     """
     Select photos using a dynamic bucket diversity strategy.
@@ -235,6 +236,18 @@ def select_photos(
         nonlocal used_bytes
         if rec["path"] in selected_paths:
             return False
+
+        # Check temporal spacing within the same event cluster
+        ts = rec.get("timestamp", 0) or 0
+        if min_spacing_seconds > 0 and ts > 0:
+            cid = rec.get("cluster_id", -1)
+            if cid >= 0:
+                for sel_rec in selected:
+                    if sel_rec.get("cluster_id", -1) == cid:
+                        sel_ts = sel_rec.get("timestamp", 0) or 0
+                        if sel_ts > 0 and abs(ts - sel_ts) < min_spacing_seconds:
+                            return False
+
         est = _est_size(rec)
         if used_bytes + est > max_bytes:
             return False
