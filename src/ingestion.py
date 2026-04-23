@@ -46,7 +46,7 @@ def load_image_safe(path: Path, max_dimension: int = 1024):
     Note: ``max_dimension`` is accepted for API compatibility but the
     downscaling step is disabled — photos are loaded at full resolution.
     """
-    from PIL import Image, ImageFile
+    from PIL import Image, ImageFile, ImageOps
     ImageFile.LOAD_TRUNCATED_IMAGES = True
 
     suffix = path.suffix.lower()
@@ -58,7 +58,9 @@ def load_image_safe(path: Path, max_dimension: int = 1024):
             pass  # will fail at Image.open if not installed
 
     try:
-        img = Image.open(path).convert("RGB")
+        img = Image.open(path)
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
         w, h = img.size
         orig_shorter = min(w, h)
         # Downscaling disabled — process and store at original resolution.

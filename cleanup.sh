@@ -76,7 +76,7 @@ while [[ $# -gt 0 ]]; do
     --all)      DO_ALL=true;     shift ;;
     --dry-run)  DRY_RUN=true;    shift ;;
     --help|-h)  SHOW_HELP=true;  shift ;;
-    *) echo -e "${RED}Unknown option: $1${RESET}" >&2; SHOW_HELP=true; shift ;;
+    *) echo -e "${RED}Unknown option: $1${RESET}" >&2; SHOW_HELP=true; BAD_OPT=true; shift ;;
   esac
 done
 
@@ -105,7 +105,7 @@ if [[ "$SHOW_HELP" == true ]]; then
   echo
   echo -e "  Flags can be combined:  ${DIM}./cleanup.sh --cache --output --dry-run${RESET}"
   echo
-  exit 0
+  [[ "${BAD_OPT:-false}" == true ]] && exit 1 || exit 0
 fi
 
 # ── Helper: remove path with size reporting ───────────────────────────────────
@@ -113,7 +113,7 @@ remove() {
   local target="$1"
   local label="$2"
 
-  if [[ ! -e "$target" ]]; then
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
     skip "$label  (not found)"
     return
   fi
@@ -124,8 +124,11 @@ remove() {
   if [[ "$DRY_RUN" == true ]]; then
     warn "[dry-run] Would delete  $label  ($size)"
   else
-    rm -rf "$target"
-    ok "Deleted  $label  ($size freed)"
+    if rm -rf "$target" 2>/dev/null; then
+      ok "Deleted  $label  ($size freed)"
+    else
+      warn "Failed to delete $label (permission denied?)"
+    fi
   fi
 }
 
@@ -177,7 +180,7 @@ if [[ "$DO_OUTPUT" == true ]]; then
   OUT_DIR="$SCRIPT_DIR/data/output_photos"
   PHOTO_COUNT=0
   if [[ -d "$OUT_DIR" ]]; then
-    PHOTO_COUNT=$(find "$OUT_DIR" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.json" \) 2>/dev/null | wc -l | xargs)
+    PHOTO_COUNT=$(find "$OUT_DIR" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.json" \) 2>/dev/null | wc -l | xargs || echo 0)
   fi
   warn "This will delete $PHOTO_COUNT output file(s) — original photos in data/input_photos/ are NOT touched"
   remove "$OUT_DIR" "data/output_photos/  (curated output)"
@@ -220,10 +223,11 @@ echo
 
 if [[ "$DO_PYCACHE" == true ]]; then
   if [[ "$DRY_RUN" == true ]]; then
-    COUNT=$(find "$SCRIPT_DIR" -not -path '*/.venv/*' \( -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' \) 2>/dev/null | wc -l | xargs)
+    COUNT=$(find "$SCRIPT_DIR" -type d -name '.venv' -prune -o \
+      \( -type d -name '__pycache__' -o -type f -name '*.pyc' -o -type f -name '*.pyo' \) -print 2>/dev/null | wc -l | xargs || echo 0)
     warn "[dry-run] Would delete $COUNT __pycache__ dirs / .pyc files"
   else
-    find "$SCRIPT_DIR" -not -path '*/.venv/*' \
+    find "$SCRIPT_DIR" -type d -name '.venv' -prune -o \
       \( -type d -name '__pycache__' -o -type f -name '*.pyc' -o -type f -name '*.pyo' \) \
       -exec rm -rf {} + 2>/dev/null || true
     ok "Deleted all __pycache__ dirs and .pyc / .pyo files"
