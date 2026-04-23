@@ -310,8 +310,10 @@ def stage_dedup(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
     """
     dup_cfg = cfg["deduplication"]
 
+    # Include quality_pass=0 photos so near-dup detection runs across the
+    # full pool (the selector now admits top-scored quality-fail photos).
     with database.connect(db_path) as conn:
-        rows = database.get_all(conn, "quality_pass=1 AND is_private=0")
+        rows = database.get_all(conn, "is_private=0")
         records = [
             {
                 "path":       r["path"],
@@ -340,7 +342,7 @@ def stage_dedup(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
 
     with database.connect(db_path) as conn:
         # Reset all before applying new flags to make stage idempotent
-        conn.execute("UPDATE photos SET is_duplicate=0 WHERE quality_pass=1 AND is_private=0")
+        conn.execute("UPDATE photos SET is_duplicate=0 WHERE is_private=0")
         for p in dup_paths:
             database.update_fields(conn, p, is_duplicate=1)
         conn.commit()
@@ -357,11 +359,13 @@ def stage_cluster(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
     """
     cl_cfg = cfg["clustering"]
 
-    # Fetch scalar metadata only — no BLOB columns needed
+    # Fetch scalar metadata only — no BLOB columns needed.
+    # Include quality_pass=0 photos so admitted soft-quality photos still
+    # participate in event clustering and temporal spacing.
     with database.connect(db_path) as conn:
         rows = conn.execute(
             "SELECT path, timestamp, lat, lon FROM photos "
-            "WHERE quality_pass=1 AND is_private=0 AND is_duplicate=0"
+            "WHERE is_private=0 AND is_duplicate=0"
         ).fetchall()
 
     # Pull all CLIP embeddings from the vector store in one batch
@@ -450,8 +454,11 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: 
     sel_cfg  = cfg["selection"]
     out_cfg  = cfg["output"]
 
+    # Pull all non-private, non-duplicate photos. `quality_pass` is handled
+    # as a soft preference inside select_photos so the strict pool can be
+    # topped up from top-scored quality-fail photos when it's too small.
     with database.connect(db_path) as conn:
-        rows    = database.get_all(conn, "quality_pass=1 AND is_private=0 AND is_duplicate=0")
+        rows    = database.get_all(conn, "is_private=0 AND is_duplicate=0")
         records = [dict(r) for r in rows]
 
     # ── Score ─────────────────────────────────────────────────────
@@ -513,6 +520,7 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: 
         max_per_hour_pct=sel_cfg.get("max_per_hour_pct", 0.05),
         max_dynamic_spacing=sel_cfg.get("max_dynamic_spacing", 600),
         min_score_pct=sel_cfg.get("min_score_pct", 0.0),
+        min_pool_fraction=sel_cfg.get("min_pool_fraction", 0.40),
         buckets=bucket_cfg,
         subject_scores=bucket_subject_scores,
         output_mode=output_mode,

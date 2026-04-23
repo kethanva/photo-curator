@@ -134,6 +134,13 @@ selection:
   max_per_hour_pct:     0.05   # max share from any single calendar hour
   max_dynamic_spacing:  600    # upper limit for dynamic temporal spacing (seconds)
   min_score_pct:        0.15   # drop bottom 15% of photos by composite score
+  # Minimum candidate pool size as a fraction of total scanned photos.
+  # If the strict (quality_pass=1) pool is smaller than this floor, the
+  # best-scored quality_pass=0 photos are admitted to pad it. Prevents
+  # aggressive blur/exposure thresholds from starving the output on
+  # libraries with many soft-focus or underexposed shots. 0.0 disables
+  # the pad (strict filter only). Default 0.40 ≈ 40% of input photos.
+  min_pool_fraction:    0.40
 
   # Output resizing — dramatically increases photos that fit in budget
   resize_output:       true

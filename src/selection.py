@@ -82,6 +82,7 @@ def select_photos(
     max_per_day_pct: float = 0.15,
     max_per_hour_pct: float = 0.05,
     min_score_pct: float = 0.0,
+    min_pool_fraction: float = 0.40,
     buckets: Optional[Dict[str, float]] = None,
     subject_scores: Optional[Dict[str, Dict[str, float]]] = None,
     output_mode: str = "bytes",
@@ -95,7 +96,13 @@ def select_photos(
     """
     Select photos using a dynamic bucket diversity strategy.
 
-    Pre-filters duplicates, private photos, and quality failures.
+    Pre-filters duplicates and private photos as HARD gates. ``quality_pass``
+    is treated as a SOFT preference: strict (quality_pass=1) candidates are
+    always preferred, but when the strict pool is smaller than
+    ``min_pool_fraction * total_photos`` the highest-scored ``quality_pass=0``
+    photos are admitted to top the pool up to that floor. This prevents
+    aggressive quality thresholds from starving the output on libraries with
+    many soft-focus or underexposed shots.
 
     Args:
         buckets:          ordered {name: fraction} — fractions should sum to 1.0.
@@ -109,6 +116,11 @@ def select_photos(
         min_score_pct:    drop the bottom fraction of candidates by composite score
                           before selection (e.g. 0.15 drops the lowest-scored 15%).
                           0.0 disables the filter.
+        min_pool_fraction: minimum candidate pool size as a fraction of
+                          ``total_photos``. If the strict (quality_pass=1)
+                          pool is smaller than this floor, the best-scored
+                          ``quality_pass=0`` photos are admitted to pad it.
+                          0.0 disables the pad (strict filter only).
 
     Budget modes
     ------------
@@ -129,12 +141,36 @@ def select_photos(
     if total_frac > 0 and abs(total_frac - 1.0) > 1e-6:
         buckets = {k: v / total_frac for k, v in buckets.items()}
 
-    candidates = [
+    # Hard gates: duplicates and privacy-flagged photos never enter the pool.
+    eligible = [
         r for r in records
-        if r.get("quality_pass", 1)
-        and not r.get("is_duplicate", 0)
-        and not r.get("is_private", 0)
+        if not r.get("is_duplicate", 0) and not r.get("is_private", 0)
     ]
+    strict_candidates = [r for r in eligible if r.get("quality_pass", 1)]
+    fallback_candidates = [r for r in eligible if not r.get("quality_pass", 1)]
+
+    # Expand the pool with best-scored quality-fail photos if the strict
+    # pool doesn't meet the configured floor. Without this, aggressive
+    # blur/exposure thresholds can starve the output (e.g. 335 photos →
+    # 11 eligible → only 5 selected after diversity caps).
+    pool_floor_base = total_photos if total_photos > 0 else len(eligible)
+    pool_floor = int(pool_floor_base * min_pool_fraction)
+    candidates = list(strict_candidates)
+    if min_pool_fraction > 0.0 and len(candidates) < pool_floor and fallback_candidates:
+        needed = min(pool_floor - len(candidates), len(fallback_candidates))
+        fallback_sorted = sorted(
+            fallback_candidates,
+            key=lambda r: scores.get(r["path"], 0.0),
+            reverse=True,
+        )
+        admitted = fallback_sorted[:needed]
+        candidates.extend(admitted)
+        print(
+            f"  Pool expansion: strict pool {len(strict_candidates)} < "
+            f"floor {pool_floor} ({min_pool_fraction*100:.0f}% of "
+            f"{pool_floor_base}). Admitted {len(admitted)} top-scored "
+            f"quality_pass=0 photos."
+        )
 
     if not candidates:
         return []
