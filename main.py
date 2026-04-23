@@ -514,6 +514,8 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: 
         output_percentage=output_pct,
         total_photos=total_photos,
         resize_output=sel_cfg.get("resize_output", True),
+        output_long_side=sel_cfg.get("output_long_side", 2560),
+        output_jpeg_quality=sel_cfg.get("output_jpeg_quality", 92),
     )
 
     pct_label = (

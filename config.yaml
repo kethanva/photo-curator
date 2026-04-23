@@ -49,7 +49,7 @@ clustering:
   time_weight: 1.0
   gps_weight: 2.0
   visual_weight: 1.5
-  eps: 0.6
+  eps: 3.0
   min_samples: 2
 
 # ── Aesthetic Scoring ───────────────────────────────────────────────────────
