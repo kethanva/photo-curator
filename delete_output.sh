@@ -49,7 +49,7 @@ if [[ ! -d "$TARGET_DIR" ]]; then
 fi
 
 # Count files
-FILE_COUNT=$(find "$TARGET_DIR" -type f ! -name ".gitkeep" 2>/dev/null | wc -l | xargs)
+FILE_COUNT=$(find "$TARGET_DIR" -type f ! -name ".gitkeep" 2>/dev/null | wc -l | xargs || echo 0)
 
 if [[ "$FILE_COUNT" -eq 0 ]]; then
   ok "Directory is already empty (no files to delete)."

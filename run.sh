@@ -286,7 +286,7 @@ fi
 # Count photos with supported extensions
 PHOTO_COUNT=0
 for ext in "${PHOTO_EXTS[@]}"; do
-  COUNT=$(find "$INPUT_DIR" -type f \( -iname "*.${ext}" \) 2>/dev/null | wc -l | xargs)
+  COUNT=$(find "$INPUT_DIR" -type f \( -iname "*.${ext}" \) 2>/dev/null | wc -l | xargs || echo 0)
   PHOTO_COUNT=$((PHOTO_COUNT + COUNT))
 done
 

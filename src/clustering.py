@@ -59,7 +59,7 @@ def _build_feature_matrix(
     scalars_norm[:, 1:3] *= gps_weight
 
     # --- Reduce CLIP with PCA ---
-    if has_clip and n > _PCA_DIM:
+    if has_clip:
         pca = PCA(n_components=min(_PCA_DIM, n - 1), random_state=42)
         clip_reduced = pca.fit_transform(clip_matrix)
         clip_scaler = StandardScaler()

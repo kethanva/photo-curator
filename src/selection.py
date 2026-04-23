@@ -25,6 +25,7 @@ Output resizing:
 from __future__ import annotations
 
 import json
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -78,12 +79,11 @@ def select_photos(
     max_per_cluster_pct: float = 0.20,
     max_per_person_pct: float = 0.10,
     max_per_location_pct: float = 0.30,
+    max_per_day_pct: float = 0.15,
     max_per_hour_pct: float = 0.05,
     min_score_pct: float = 0.0,
     buckets: Optional[Dict[str, float]] = None,
     subject_scores: Optional[Dict[str, Dict[str, float]]] = None,
-    output_long_side: int = 2560,
-    output_jpeg_quality: int = 92,
     output_mode: str = "bytes",
     output_percentage: float = 0.15,
     total_photos: int = 0,
@@ -98,6 +98,9 @@ def select_photos(
         buckets:          ordered {name: fraction} — fractions should sum to 1.0.
                           Defaults to {"people": 0.30, "location": 0.30, "aesthetic": 0.40}.
         subject_scores:   {bucket_name: {path: similarity}} for CLIP subject buckets.
+        max_per_day_pct:  max fraction of output from any single calendar day.
+                          Strongest temporal diversity guard — prevents one shooting
+                          session from dominating. 0.0 disables.
         max_per_hour_pct: max fraction of output from any single calendar hour.
                           0.0 disables the cap.
         min_score_pct:    drop the bottom fraction of candidates by composite score
@@ -157,42 +160,54 @@ def select_photos(
     cap_base = max_photos if max_photos is not None else len(candidates)
     target_for_cap = max_photos if max_photos is not None else len(candidates)
 
-    max_per_person_n   = max(1, int(cap_base * max_per_person_pct))
-    max_per_location_n = max(1, int(cap_base * max_per_location_pct))
-    max_per_cluster_n  = max(1, int(cap_base * max_per_cluster_pct))
+    # All diversity caps below are STRICT — no auto-raise. Previously the
+    # cluster and hour caps silently relaxed themselves to ceil(target/buckets)
+    # when strict caps would have starved the target, which let one event fill
+    # ~50% of small outputs. Symmetrical strict-everywhere matches the day-cap
+    # philosophy: diversity wins over hitting the exact count. If caps prevent
+    # reaching target, a warning is logged at the end of selection.
 
-    # Only enforce the event-cluster cap when it can't starve the target.
+    max_per_person_n   = max(1, int(np.ceil(cap_base * max_per_person_pct)))
+    max_per_location_n = max(1, int(np.ceil(cap_base * max_per_location_pct)))
+    max_per_cluster_n  = max(1, int(np.ceil(cap_base * max_per_cluster_pct)))
+
+    def _day_key(rec: dict) -> int:
+        """Local-time calendar day. Photos missing a timestamp share bucket -1
+        so they cannot pile up unnoticed."""
+        ts = rec.get("timestamp", 0) or 0
+        if ts <= 0:
+            return -1
+        lt = time.localtime(ts)
+        return lt.tm_year * 1000 + lt.tm_yday
+
+    def _hour_key(rec: dict) -> int:
+        """Local-time calendar hour. Missing-timestamp photos pool under -1."""
+        ts = rec.get("timestamp", 0) or 0
+        if ts <= 0:
+            return -1
+        lt = time.localtime(ts)
+        return lt.tm_year * 1_000_000 + lt.tm_yday * 100 + lt.tm_hour
+
+    # Cluster cap — strict.
     distinct_clusters = {
         r.get("cluster_id", -1) for r in candidates
         if r.get("cluster_id", -1) >= 0
     }
-    num_clusters = len(distinct_clusters)
-    enforce_cluster_cap = (
-        num_clusters >= 2
-        and num_clusters * max_per_cluster_n >= target_for_cap
-    )
+    enforce_cluster_cap = len(distinct_clusters) >= 2
 
-    # Hour cap: always enforce when there are >= 2 distinct timestamp hours.
-    # Raise cap to ceil(target/num_hours) so the target remains reachable,
-    # while still preventing a single hour from dominating the output.
-    # Previously the cap was disabled when hour-capacity < target, which caused
-    # same-timerange photos to pile up. Now it always fires for >= 2 hours.
+    # Day cap — strict.
+    max_per_day_n: Optional[int] = None
+    if max_per_day_pct > 0.0:
+        distinct_days = {_day_key(r) for r in candidates}
+        if len(distinct_days) >= 2:
+            max_per_day_n = max(1, int(np.ceil(cap_base * max_per_day_pct)))
+
+    # Hour cap — strict.
+    max_per_hour_n: Optional[int] = None
     if max_per_hour_pct > 0.0:
-        distinct_hours = {
-            int((r.get("timestamp", 0) or 0) / 3600)
-            for r in candidates
-            if (r.get("timestamp", 0) or 0) > 0
-        }
-        num_hours = len(distinct_hours)
-        if num_hours >= 2:
-            raw_hour_cap = max(1, int(cap_base * max_per_hour_pct))
-            # Raise cap so the total reachable output equals at least the target
-            min_needed = max(1, int(np.ceil(target_for_cap / num_hours)))
-            max_per_hour_n: Optional[int] = max(raw_hour_cap, min_needed)
-        else:
-            max_per_hour_n = None  # single hour or no timestamps — skip cap
-    else:
-        max_per_hour_n = None
+        distinct_hours = {_hour_key(r) for r in candidates}
+        if len(distinct_hours) >= 2:
+            max_per_hour_n = max(1, int(np.ceil(cap_base * max_per_hour_pct)))
 
     # ── Estimate output sizes after resizing ──────────────────────
     # When resize_output is enabled, photos are re-encoded as JPEG at
@@ -214,10 +229,7 @@ def select_photos(
     selected: List[dict] = []
     used_bytes: int = 0
     hour_counts: Dict[int, int] = defaultdict(int)
-
-    def _hour_key(rec: dict) -> int:
-        ts = rec.get("timestamp", 0) or 0
-        return int(ts / 3600) if ts > 0 else -1
+    day_counts: Dict[int, int] = defaultdict(int)
 
     def _add(rec: dict) -> bool:
         nonlocal used_bytes
@@ -228,18 +240,22 @@ def select_photos(
             return False
         if max_photos is not None and len(selected) >= max_photos:
             return False
-        # Per-hour temporal diversity cap
+        # Per-day temporal diversity cap — applies to the missing-timestamp
+        # pool (-1) too, so untimed photos can't bypass it.
+        if max_per_day_n is not None:
+            if day_counts[_day_key(rec)] >= max_per_day_n:
+                return False
+        # Per-hour temporal diversity cap — same pooling for missing timestamps.
         if max_per_hour_n is not None:
-            hk = _hour_key(rec)
-            if hk >= 0 and hour_counts[hk] >= max_per_hour_n:
+            if hour_counts[_hour_key(rec)] >= max_per_hour_n:
                 return False
         selected_paths.add(rec["path"])
         selected.append(rec)
         used_bytes += est
+        if max_per_day_n is not None:
+            day_counts[_day_key(rec)] += 1
         if max_per_hour_n is not None:
-            hk = _hour_key(rec)
-            if hk >= 0:
-                hour_counts[hk] += 1
+            hour_counts[_hour_key(rec)] += 1
         return True
 
     def _budget_exhausted() -> bool:
@@ -303,12 +319,42 @@ def select_photos(
                 subj_scores, bucket_byte_budget, bucket_photo_cap,
             )
 
-    # ── Aesthetic catch-all (always last) ────────────────────────
+    # ── Aesthetic share (always last) ────────────────────────────
+    # Respects aesthetic_fraction as a real share, not "all leftover".
+    # Other buckets that undershot their share leave budget on the table —
+    # consistent with the strict-cap philosophy. The undershoot warning
+    # below makes that visible.
     if aesthetic_fraction > 0 and not _budget_exhausted():
+        aesthetic_byte_budget = int(max_bytes * aesthetic_fraction)
+        aesthetic_photo_cap = (
+            max(1, int(max_photos * aesthetic_fraction))
+            if max_photos is not None else None
+        )
         _fill_aesthetic_bucket(
-            sorted_cands, selected_paths, _add, _budget_exhausted,
+            sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
             person_counts, max_per_person_n,
             cluster_counts, _cluster_capped,
+            _day_key, _hour_key, day_counts, hour_counts,
+            max_per_day_n, max_per_hour_n,
+            aesthetic_byte_budget, aesthetic_photo_cap,
+        )
+
+    # Make strict-cap undershoot visible. Hidden auto-raise was the recurring
+    # bug we just removed — surfacing the gap is the honest replacement.
+    if max_photos is not None and len(selected) < max_photos:
+        active = [
+            f"day={max_per_day_n}" if max_per_day_n is not None else None,
+            f"hour={max_per_hour_n}" if max_per_hour_n is not None else None,
+            f"cluster={max_per_cluster_n}" if enforce_cluster_cap else None,
+            f"person={max_per_person_n}",
+            f"location={max_per_location_n}",
+        ]
+        active_str = ", ".join(c for c in active if c)
+        print(
+            f"  Note: selected {len(selected)} / target {max_photos}. "
+            f"Diversity caps capped the output ({active_str}). "
+            f"Raise max_per_*_pct in config.yaml or supply more diverse input "
+            f"to reach the target."
         )
 
     return selected
@@ -325,8 +371,11 @@ def _fill_people_bucket(
     byte_budget, photo_cap,
 ):
     used = 0
+    bucket_selected = 0
     for rec in sorted_cands:
         if _budget_exhausted():
+            break
+        if photo_cap is not None and bucket_selected >= photo_cap:
             break
         pid = rec.get("person_id", -1)
         if pid < 0 or not rec.get("is_frequent", 0):
@@ -336,8 +385,6 @@ def _fill_people_bucket(
         cid = rec.get("cluster_id", -1)
         if _cluster_capped(cid):
             continue
-        if photo_cap is not None and sum(person_counts.values()) >= photo_cap:
-            continue
         est = _est_size(rec)
         if used + est > byte_budget:
             continue
@@ -345,6 +392,7 @@ def _fill_people_bucket(
             person_counts[pid] += 1
             cluster_counts[cid] += 1
             used += est
+            bucket_selected += 1
 
 
 def _fill_location_bucket(
@@ -431,19 +479,34 @@ def _fill_subject_bucket(
 
 
 def _fill_aesthetic_bucket(
-    sorted_cands, selected_paths, _add, _budget_exhausted,
+    sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
     person_counts, max_per_person_n,
     cluster_counts, _cluster_capped,
+    _day_key, _hour_key, day_counts, hour_counts,
+    max_per_day_n, max_per_hour_n,
+    byte_budget, photo_cap,
 ):
-    """Aesthetic catch-all — fills remaining budget with highest-scored photos.
+    """Aesthetic share — fills its configured byte/photo share with the
+    highest-scored remaining candidates.
 
-    Enforces the event-cluster cap so the catch-all cannot collapse all
-    diversity by repeatedly picking top-ranked photos from one event.
+    Enforces every diversity cap (person, cluster, day, hour) before the
+    `_add` call so iteration doesn't bounce off saturated buckets.
+    Skipping saturated day/hour buckets early naturally promotes
+    under-represented buckets without an explicit round-robin pass.
     """
+    used = 0
+    bucket_selected = 0
     for rec in sorted_cands:
         if _budget_exhausted():
             break
         if rec["path"] in selected_paths:
+            continue
+        if photo_cap is not None and bucket_selected >= photo_cap:
+            break
+        # Early diversity skips — avoid the wasted _add call when caps already bind.
+        if max_per_day_n is not None and day_counts[_day_key(rec)] >= max_per_day_n:
+            continue
+        if max_per_hour_n is not None and hour_counts[_hour_key(rec)] >= max_per_hour_n:
             continue
         pid = rec.get("person_id", -1)
         if pid >= 0 and person_counts[pid] >= max_per_person_n:
@@ -451,7 +514,12 @@ def _fill_aesthetic_bucket(
         cid = rec.get("cluster_id", -1)
         if _cluster_capped(cid):
             continue
+        est = _est_size(rec)
+        if used + est > byte_budget:
+            continue
         if _add(rec):
+            used += est
+            bucket_selected += 1
             cluster_counts[cid] += 1
             if pid >= 0:
                 person_counts[pid] += 1

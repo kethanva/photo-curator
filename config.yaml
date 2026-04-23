@@ -125,9 +125,11 @@ selection:
   # Per-bucket caps — fraction of the output target (0.0 – 1.0)
   # Example: 20 output photos → 0.15 = 3, 0.06 = 1-2
   max_per_person_pct:   0.20   # max share of output for any single identified person
-  max_per_location_pct: 0.15   # max share from any single GPS/event cluster (was 0.25)
+  max_per_location_pct: 0.15   # max share from any single GPS/event cluster
   max_per_cluster_pct:  0.08   # event-cluster cap — tighter to prevent same-event pileup
-  max_per_hour_pct:     0.05   # max share from any single calendar hour (temporal spread)
+  max_per_day_pct:      0.15   # NEW: max share from any single calendar day (strongest temporal guard)
+                               # e.g. 20-photo output → max 3 photos per shooting day
+  max_per_hour_pct:     0.05   # max share from any single calendar hour
   min_score_pct:        0.15   # drop bottom 15% of photos by composite score
 
   # Output resizing — dramatically increases photos that fit in budget

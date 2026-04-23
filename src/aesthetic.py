@@ -114,11 +114,13 @@ def _load_laion_predictor():
         print("  Downloading aesthetic predictor weights…")
         try:
             from huggingface_hub import hf_hub_download
+            import shutil
             downloaded = hf_hub_download(
                 repo_id="christophschuhmann/improved-aesthetic-predictor",
                 filename="sac+logos+ava1-l14-linearMSE.pth",
                 local_dir=str(cache_path.parent),
             )
+            shutil.move(downloaded, cache_path)
         except Exception as e:
             print(f"  Warning: could not download aesthetic model ({e}). Falling back to CLIP.")
             return None
