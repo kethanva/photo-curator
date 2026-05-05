@@ -11,6 +11,7 @@ The CLIP check reuses the already-loaded model from embeddings.py.
 
 from __future__ import annotations
 
+import re
 from math import atan2, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Iterable, Optional, Tuple, Union
@@ -82,12 +83,29 @@ _clip_loaded = False
 # Dedicated binary text-heavy / screenshot detection
 # ---------------------------------------------------------------------------
 
-# Two-prompt binary check: text-image vs real photo.
-# Binary softmax avoids the dilution problem of the 11-prompt multi-class
-# classifier — a chat screenshot scores 0.70+ on _TEXT_HEAVY_PROMPT vs 0.50
-# threshold becomes easy to clear.
-_TEXT_HEAVY_PROMPT = (
-    "a screenshot of text messages, chat conversations, or a text-only image"
+# Multiple text-heavy variants vs a single real-photo baseline. We run a
+# *separate* binary softmax for each (variant, real_photo) pair and OR
+# the results together — that way, a real photo (which doesn't strongly
+# match ANY single variant) stays below threshold, while a text-heavy
+# image (which strongly matches at least one variant) clears it.
+#
+# A multi-class softmax across all variants would dilute the per-variant
+# probability, which is why the previous single-prompt design was used;
+# the per-variant binary trick keeps that property while broadening the
+# kinds of text-heavy content we catch — chat screenshots, photos of
+# printed pages and notebooks, signs/posters dominated by text, slides
+# from a presentation, calendar/schedule pages, and meme images with
+# heavy text overlay. Real Android camera filenames like
+# ``IMG_20190125_110258.jpg`` of a calendar page slipped through the
+# single-prompt design because "chat / text-only image" didn't capture
+# camera photos of printed material.
+_TEXT_HEAVY_PROMPTS = (
+    "a screenshot of text messages, chat conversations, or a text-only image",
+    "a photo of a printed page, document, notebook, or letter",
+    "a photo of a calendar, schedule, or table dominated by text rows",
+    "a photo of a sign, poster, or flyer where text fills most of the frame",
+    "a screenshot of a slide, presentation, or social media post",
+    "a meme or graphic dominated by overlaid text or captions",
 )
 _REAL_PHOTO_PROMPT = "a real photograph of people, places, or objects"
 
@@ -118,7 +136,13 @@ def _get_clip_text_features():
 
 
 def _get_text_heavy_features():
-    """Encode the binary text-heavy prompts once and cache them."""
+    """Encode every text-heavy variant + the real-photo baseline once.
+
+    Layout: rows ``[0..N-1]`` are the text-heavy variants in
+    ``_TEXT_HEAVY_PROMPTS`` order; row ``N`` is the real-photo baseline.
+    ``is_text_heavy_from_embedding`` runs a separate binary softmax for
+    each ``(variant_i, baseline)`` pair and ORs the results.
+    """
     global _text_heavy_features, _text_heavy_loaded
     import torch
     import clip
@@ -127,7 +151,8 @@ def _get_text_heavy_features():
     model, preprocess, device = load_model()
 
     if not _text_heavy_loaded:
-        tokens = clip.tokenize([_TEXT_HEAVY_PROMPT, _REAL_PHOTO_PROMPT]).to(device)
+        prompts = list(_TEXT_HEAVY_PROMPTS) + [_REAL_PHOTO_PROMPT]
+        tokens = clip.tokenize(prompts).to(device)
         with torch.no_grad():
             feats = model.encode_text(tokens)
         feats = feats / feats.norm(dim=-1, keepdim=True)
@@ -139,28 +164,47 @@ def _get_text_heavy_features():
 
 def is_text_heavy_from_embedding(
     clip_emb: Optional[np.ndarray],
-    threshold: float = 0.50,
+    threshold: float = 0.55,
 ) -> bool:
     """
-    Binary CLIP check: True when the image looks like a screenshot or text-only image.
+    CLIP check: True when the image is dominated by text content.
 
-    Uses a two-prompt softmax so probability is not diluted across many classes.
-    A genuine chat screenshot scores ~0.70–0.85 on the text-heavy prompt;
-    real photographs with incidental text (signs, menus) typically score < 0.55.
+    Runs a *per-variant* binary softmax against the real-photo baseline
+    (text_heavy_i vs real_photo) and returns True if the max text-heavy
+    probability across all variants clears ``threshold``. This sidesteps
+    the multi-class dilution that capped the old single-prompt design at
+    chat / quote screenshots only — camera photos of printed pages,
+    posters, calendars, and presentation slides now score above 0.60 on
+    at least one matching variant.
 
-    threshold=0.60 keeps false-positive rate very low on real photos.
+    The 0.55 default sits at the empirical separation point: real photos
+    with incidental text (street signs, menus in the background) peak
+    around 0.45–0.52 on the closest variant, while genuine text-heavy
+    content (printed pages, chat captures, posters) sits at 0.60–0.85.
     """
     if clip_emb is None:
         return False
     try:
         import torch
 
-        text_feats, _, _, device = _get_text_heavy_features()
+        all_feats, _, _, device = _get_text_heavy_features()
         image_tensor = torch.tensor(clip_emb, device=device).unsqueeze(0)
         image_tensor = image_tensor / image_tensor.norm(dim=-1, keepdim=True)
-        logits = (image_tensor @ text_feats.T * 100.0).softmax(dim=-1)
-        text_prob = float(logits[0, 0].item())
-        return text_prob >= threshold
+
+        # Last row is the real-photo baseline; everything before it is a
+        # text-heavy variant. Build a binary (variant, baseline) pair for
+        # each variant and softmax separately so dilution can't sink the
+        # text-heavy mass below threshold.
+        baseline = all_feats[-1:]
+        variants = all_feats[:-1]
+        max_text_prob = 0.0
+        for i in range(variants.shape[0]):
+            pair = torch.cat([variants[i:i + 1], baseline], dim=0)
+            logits = (image_tensor @ pair.T * 100.0).softmax(dim=-1)
+            prob = float(logits[0, 0].item())
+            if prob > max_text_prob:
+                max_text_prob = prob
+        return max_text_prob >= threshold
     except Exception:
         return False
 
@@ -201,11 +245,13 @@ def _get_boring_features():
 
 def is_boring_from_embedding(
     clip_emb: Optional[np.ndarray],
-    threshold: float = 0.20,
-    ratio: float = 2.0,
+    threshold: float = 0.90,
+    ratio: float = 20.0,
 ) -> bool:
     """
-    CLIP check: True when image looks like a mundane single object (door, tubelight, wall).
+    CLIP check: True when image strongly looks like a mundane single object
+    (door, tubelight, wall). Kept conservative because this is an exclusion
+    gate, not just a ranking signal.
     """
     if clip_emb is None:
         return False
@@ -265,11 +311,11 @@ def _get_intimate_features():
 
 def is_intimate_from_embedding(
     clip_emb: Optional[np.ndarray],
-    threshold: float = 0.20,
-    ratio: float = 2.0,
+    threshold: float = 0.80,
+    ratio: float = 20.0,
 ) -> bool:
     """
-    CLIP check: True when image looks like intimate/NSFW content.
+    CLIP check: True when image strongly looks like intimate/NSFW content.
     """
     if clip_emb is None:
         return False
@@ -313,8 +359,8 @@ def _private_vs_normal_probs(image_emb: np.ndarray) -> Optional[np.ndarray]:
 
 def _is_private_from_probs(
     probs: np.ndarray,
-    threshold: float = 0.50,
-    ratio: float = 2.5,
+    threshold: float = 0.40,
+    ratio: float = 3.0,
 ) -> bool:
     """
     Decide if the prob distribution indicates a private/document image.
@@ -341,7 +387,11 @@ def _is_private_from_probs(
     return best_private >= ratio * max(normal_prob, 1e-6)
 
 
-def is_document_clip(img: Image.Image, threshold: float = 0.20) -> bool:
+def is_document_clip(
+    img: Image.Image,
+    threshold: float = 0.40,
+    ratio: float = 3.0,
+) -> bool:
     """CLIP zero-shot: True when image looks like a document / private item."""
     try:
         from src.embeddings import load_model, extract
@@ -351,14 +401,15 @@ def is_document_clip(img: Image.Image, threshold: float = 0.20) -> bool:
         probs = _private_vs_normal_probs(image_emb)
         if probs is None:
             return False
-        return _is_private_from_probs(probs, threshold)
+        return _is_private_from_probs(probs, threshold, ratio)
     except Exception:
         return False
 
 
 def is_document_from_embedding(
     clip_emb: Optional[np.ndarray],
-    threshold: float = 0.20,
+    threshold: float = 0.40,
+    ratio: float = 3.0,
 ) -> bool:
     """
     CLIP zero-shot privacy check from a pre-computed embedding.
@@ -370,7 +421,82 @@ def is_document_from_embedding(
     probs = _private_vs_normal_probs(clip_emb)
     if probs is None:
         return False
-    return _is_private_from_probs(probs, threshold)
+    return _is_private_from_probs(probs, threshold, ratio)
+
+
+def looks_like_text_document_page(img: Image.Image) -> bool:
+    """
+    Heuristic for camera photos of text-heavy pages, calendars, and tables.
+
+    CLIP alone is too blunt here: it can confuse busy scenes with documents.
+    This structural check looks for a large light page region containing many
+    straight horizontal/vertical strokes, which is typical of printed tables
+    and uncommon in normal people/action photos.
+    """
+    try:
+        import cv2
+
+        arr = np.array(img.convert("RGB"))
+        h, w = arr.shape[:2]
+        scale = 1000.0 / max(h, w)
+        if scale < 1.0:
+            arr = cv2.resize(arr, (int(w * scale), int(h * scale)))
+
+        hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+        light_low_sat = (
+            ((hsv[:, :, 2] > 145) & (hsv[:, :, 1] < 85)).astype("uint8") * 255
+        )
+        paper_frac = float(light_low_sat.mean() / 255.0)
+        if paper_frac < 0.45:
+            return False
+
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        masked_edges = cv2.bitwise_and(edges, edges, mask=light_low_sat)
+        masked_edge_frac = float(masked_edges.mean() / 255.0)
+        if masked_edge_frac < 0.06:
+            return False
+
+        lines = cv2.HoughLinesP(
+            masked_edges,
+            1,
+            np.pi / 180,
+            threshold=50,
+            minLineLength=60,
+            maxLineGap=8,
+        )
+        if lines is None:
+            return False
+
+        hv_lines = 0
+        for line in lines[:, 0, :]:
+            x1, y1, x2, y2 = line
+            dx = abs(int(x2) - int(x1))
+            dy = abs(int(y2) - int(y1))
+            if (dx * dx + dy * dy) ** 0.5 < 60:
+                continue
+            angle = np.degrees(np.arctan2(dy, dx)) if dx or dy else 0.0
+            if angle < 8.0 or angle > 82.0:
+                hv_lines += 1
+
+        return hv_lines >= 50
+    except Exception:
+        return False
+
+
+def is_document_page_from_embedding_and_image(
+    clip_emb: Optional[np.ndarray],
+    img: Image.Image,
+) -> bool:
+    """True for text-heavy page photos that the conservative doc gate misses."""
+    if clip_emb is None:
+        return False
+    probs = _private_vs_normal_probs(clip_emb)
+    if probs is None:
+        return False
+    if not _is_private_from_probs(probs, threshold=0.60, ratio=50.0):
+        return False
+    return looks_like_text_document_page(img)
 
 
 # ---------------------------------------------------------------------------
@@ -396,19 +522,44 @@ _RESHARED_PREFIXES: Tuple[str, ...] = (
 )
 
 
+# Pure-numeric stems of 10–13 digits (optionally with a trailing -N or _N
+# sub-index) match Unix-epoch filenames written by WhatsApp on iOS,
+# Messenger, Telegram, and similar messaging exports — e.g.
+# 1568579433476.jpg (13-digit ms epoch). These files carry no EXIF, no
+# camera model, no GPS, and are almost always forwarded content the user
+# never took themselves. 14+ digits are excluded because that's the range
+# of YYYYMMDDHHMMSS dates that some cameras still write.
+_MESSAGING_NUMERIC_RE = re.compile(r"^\d{10,13}(?:[-_]\d+)?$")
+
+
 def is_reshared_filename(
     path: Union[str, Path],
     prefixes: Optional[Iterable[str]] = None,
 ) -> bool:
     """
     True when the filename matches a well-known messaging/social reshare
-    pattern (FB_IMG_*, WhatsApp*, Screenshot_*, etc).
+    pattern (FB_IMG_*, WhatsApp*, Screenshot_*, 1568579433476.jpg, …).
 
     Comparison is case-insensitive against the leaf filename only.
+
+    Two checks run in order:
+      1. Prefix match against the configured ``prefixes`` (defaults to the
+         built-in ``_RESHARED_PREFIXES`` list).
+      2. Pure-numeric stem of 10–13 digits — a strong messaging-app signal
+         independent of any prefix list. Always runs even when callers
+         supply a custom ``prefixes`` iterable, because the numeric pattern
+         is universal and not something users typically want to opt out of.
     """
     name = Path(path).name.lower()
     active = tuple(p.lower() for p in prefixes) if prefixes else _RESHARED_PREFIXES
-    return any(name.startswith(p) for p in active)
+    if any(name.startswith(p) for p in active):
+        return True
+
+    stem = Path(path).stem.lower()
+    if _MESSAGING_NUMERIC_RE.match(stem):
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +572,8 @@ def reassess_is_private_from_cache(
     conn,
     filter_reshared: bool = True,
     reshared_prefixes: Optional[Iterable[str]] = None,
-    threshold: float = 0.50,
+    threshold: float = 0.40,
+    document_ratio: float = 3.0,
     filter_text_heavy: bool = True,
     filter_boring_objects: bool = True,
     filter_intimate_content: bool = True,
@@ -441,7 +593,8 @@ def reassess_is_private_from_cache(
     from src import database
 
     rows = conn.execute(
-        "SELECT path, clip_emb, is_private FROM photos"
+        "SELECT path, clip_emb, is_private, camera_model, has_gps, face_count "
+        "FROM photos"
     ).fetchall()
 
     changed = 0
@@ -450,43 +603,43 @@ def reassess_is_private_from_cache(
         clip_emb = database.blob_to_emb(row["clip_emb"])
         prev = int(row["is_private"])
 
-        # Preserve previous True if it came from screenshot/home rules —
-        # we can only safely *revoke* a False positive from the CLIP doc
-        # rule.  So: only overwrite when the new assessment disagrees with
-        # the doc/reshared components, keeping other signals intact.
-        doc_hit = (
-            is_document_from_embedding(clip_emb, threshold)
-            if clip_emb is not None else False
-        )
+        if clip_emb is None:
+            continue
+
+        doc_hit = is_document_from_embedding(clip_emb, threshold, document_ratio)
         reshared_hit = (
             filter_reshared and is_reshared_filename(path, reshared_prefixes)
         )
-        text_hit = (
-            filter_text_heavy and is_text_heavy_from_embedding(clip_emb)
-            if clip_emb is not None else False
-        )
-        boring_hit = (
-            filter_boring_objects and is_boring_from_embedding(clip_emb)
-            if clip_emb is not None else False
-        )
+        text_hit = filter_text_heavy and is_text_heavy_from_embedding(clip_emb)
+        boring_hit = filter_boring_objects and is_boring_from_embedding(clip_emb)
         intimate_hit = (
             filter_intimate_content and is_intimate_from_embedding(clip_emb)
-            if clip_emb is not None else False
         )
-        new_flag = int(doc_hit or reshared_hit or text_hit or boring_hit or intimate_hit)
+        new_flag_from_cache = bool(
+            doc_hit or reshared_hit or text_hit or boring_hit or intimate_hit
+        )
 
-        # We only reassess photos whose prior is_private was set by the
-        # (now-fixed) CLIP doc logic.  If the screenshot heuristic set
-        # it True, that flag is independent and should be recomputed
-        # separately — not in scope here.  Simplest honest rule: take
-        # the logical OR of prior non-CLIP reasons + new CLIP/filename
-        # reasons.  
-        # Since we can't cleanly distinguish prior reasons, we assume a 
-        # previous True must be respected (logical OR).
-        if clip_emb is None:
-            continue
-        
-        final_flag = int(prev or new_flag)
+        # Reassessment only sees CLIP-recomputable + filename signals. Two other
+        # rules (is_screenshot — needs original image dims; is_home_private —
+        # needs the home config + EXIF GPS) ran at ingest and aren't replayed
+        # here. To avoid sticky CLIP false-positives from older loose
+        # thresholds, we revoke a prior True only when the photo carries
+        # strong "real photo" signals: a camera model, GPS, or detected faces.
+        # Photos without any of those signals stay flagged — they are likely
+        # screenshots / home-private hits we can't recompute from cache.
+        if new_flag_from_cache:
+            final_flag = 1
+        elif prev:
+            camera_model = (row["camera_model"] or "").strip()
+            has_gps = int(row["has_gps"] or 0)
+            face_count = int(row["face_count"] or 0)
+            has_real_photo_signal = (
+                bool(camera_model) or has_gps > 0 or face_count > 0
+            )
+            final_flag = 0 if has_real_photo_signal else 1
+        else:
+            final_flag = 0
+
         if final_flag != prev:
             conn.execute(
                 "UPDATE photos SET is_private=? WHERE path=?",
@@ -577,6 +730,12 @@ def assess(
     # that slip past the multi-class document detector due to probability dilution.
     if filter_text_heavy and clip_emb is not None:
         if is_text_heavy_from_embedding(clip_emb):
+            return True
+        # Structural backstop for camera photos of printed pages / calendars /
+        # tables that CLIP misses (e.g. a phone shot of a wall calendar saved
+        # as IMG_YYYYMMDD_HHMMSS.jpg). Runs only at ingest because it needs
+        # the original image data — the cache reassess path can't replay it.
+        if looks_like_text_document_page(img):
             return True
     # Boring objects filter
     if filter_boring_objects and clip_emb is not None:

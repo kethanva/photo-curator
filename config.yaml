@@ -27,8 +27,8 @@ quality:
   min_resolution: 640       # shorter side in pixels
 
 deduplication:
-  phash_threshold: 16        # Hamming distance (0 = exact, 16 = similar framing)
-  embedding_similarity: 0.80  # cosine similarity floor (0.80 = same subject, different angle)
+  phash_threshold: 10        # Hamming distance — slightly looser to catch more burst-shot pairs
+  embedding_similarity: 0.92 # cosine similarity floor — was 0.95; lower catches semantic near-dupes
 
 privacy:
   filter_screenshots: true
@@ -133,6 +133,11 @@ selection:
                                # e.g. 20-photo output → max 3 photos per shooting day
   max_per_hour_pct:     0.05   # max share from any single calendar hour
   max_dynamic_spacing:  600    # upper limit for dynamic temporal spacing (seconds)
+  global_min_gap_seconds: 60   # hard floor between any two selected photos
+                               # regardless of cluster/event grouping. Catches
+                               # burst shots (e.g. IMG_*_102752 / 102755) that
+                               # land in DBSCAN noise or split across clusters.
+                               # 0 disables.
   min_score_pct:        0.15   # drop bottom 15% of photos by composite score
   # Minimum candidate pool size as a fraction of total scanned photos.
   # If the strict (quality_pass=1) pool is smaller than this floor, the

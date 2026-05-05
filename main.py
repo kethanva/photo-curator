@@ -282,6 +282,32 @@ def stage_sentiment(cfg: dict, db_path: str, paths) -> None:
     print(f"  Scored sentiment for {updates} photos")
 
 
+def stage_backfill_filename_timestamps(db_path: str) -> int:
+    """Recover timestamps from filenames for cached photos missing EXIF time.
+
+    Cheap (filename parsing only — no image I/O), so it runs unconditionally.
+    Returns the number of rows updated. Caller should re-run clustering when
+    this returns > 0 because event grouping and temporal spacing depend on
+    a usable timestamp.
+    """
+    updated = 0
+    with database.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT path, timestamp FROM photos WHERE timestamp IS NULL OR timestamp <= 0"
+        ).fetchall()
+        for row in rows:
+            ts = metadata.parse_timestamp_from_filename(row["path"])
+            if ts > 0:
+                conn.execute(
+                    "UPDATE photos SET timestamp=? WHERE path=?",
+                    (ts, row["path"]),
+                )
+                updated += 1
+        conn.commit()
+    print(f"  Recovered timestamps from filenames for {updated} / {len(rows)} photos")
+    return updated
+
+
 def stage_reassess_privacy(cfg: dict, db_path: str) -> None:
     """Re-apply privacy rules to all cached photos using stored embeddings.
 
@@ -519,6 +545,10 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: 
         max_per_day_pct=sel_cfg.get("max_per_day_pct", 0.15),
         max_per_hour_pct=sel_cfg.get("max_per_hour_pct", 0.05),
         max_dynamic_spacing=sel_cfg.get("max_dynamic_spacing", 600),
+        global_min_gap_seconds=sel_cfg.get("global_min_gap_seconds", 60.0),
+        # Blur cutoff lives in the quality config but applies inside selection
+        # so it covers cached rows that pre-date a tightened threshold.
+        min_blur_score=cfg.get("quality", {}).get("min_blur_score", 50.0),
         min_score_pct=sel_cfg.get("min_score_pct", 0.0),
         min_pool_fraction=sel_cfg.get("min_pool_fraction", 0.40),
         buckets=bucket_cfg,
@@ -641,6 +671,14 @@ def run(
     # ── Privacy re-assessment (always runs — no image I/O, uses cached embeddings)
     print("[*/9] Re-assessing privacy rules on cached photos…")
     stage_reassess_privacy(cfg, db_path)
+
+    # ── Filename timestamp recovery (cheap — no image I/O, only filename parsing)
+    # Must run before clustering and selection so day/hour caps and event
+    # grouping work for cached photos that lacked EXIF timestamps at ingest
+    # (WhatsApp, screenshots, manual exports). Newly ingested photos already
+    # get this fallback inline via metadata.extract_exif.
+    print("[*/9] Recovering filename timestamps for cached photos…")
+    stage_backfill_filename_timestamps(db_path)
 
     # ── Stage 6: Deduplication ────────────────────────────────────
     if _stage(6, "Deduplication"):

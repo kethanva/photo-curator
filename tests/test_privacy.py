@@ -13,12 +13,15 @@ from PIL import Image
 
 from src.privacy import (
     _SCREEN_RESOLUTIONS,
+    _TEXT_HEAVY_PROMPTS,
     _haversine_km,
     _is_private_from_probs,
     assess,
+    is_document_from_embedding,
     is_home_private,
     is_reshared_filename,
     is_screenshot,
+    is_text_heavy_from_embedding,
 )
 
 
@@ -287,6 +290,31 @@ class TestIsPrivateFromProbs:
         assert _is_private_from_probs(probs, threshold=0.50, ratio=3.0) is False
 
 
+class TestDocumentEmbedding:
+    def test_default_document_gate_catches_clear_documents(self):
+        """Default document filtering MUST catch clear text/document hits.
+
+        The previous defaults (threshold=0.95, ratio=50) were unreachable
+        because softmax over 11 prompts dilutes each probability to 0.30–0.50,
+        so almost no documents were filtered. Defaults are now 0.40 / 3.0.
+        """
+        emb = np.ones(512, dtype=np.float32)
+        probs = np.zeros(11, dtype=float)
+        probs[0] = 0.80    # strong document signal
+        probs[-1] = 0.05   # weak normal signal
+        with patch("src.privacy._private_vs_normal_probs", return_value=probs):
+            assert is_document_from_embedding(emb) is True
+
+    def test_default_document_gate_does_not_overflag_normal_photos(self):
+        """A normal photo with weak document signals must still pass."""
+        emb = np.ones(512, dtype=np.float32)
+        probs = np.zeros(11, dtype=float)
+        probs[0] = 0.20    # weak document signal
+        probs[-1] = 0.40   # strong normal signal
+        with patch("src.privacy._private_vs_normal_probs", return_value=probs):
+            assert is_document_from_embedding(emb) is False
+
+
 class TestIsResharedFilename:
     @pytest.mark.parametrize("name", [
         "FB_IMG_1558616482459.jpg",
@@ -304,11 +332,33 @@ class TestIsResharedFilename:
         assert is_reshared_filename(name) is True
 
     @pytest.mark.parametrize("name", [
+        "1568579433476.jpg",         # WhatsApp iOS — 13-digit ms epoch
+        "1568579433.jpg",            # 10-digit second epoch
+        "1568579433476-2.jpg",       # ms epoch with sub-index
+        "1568579433476_1.jpeg",      # ms epoch with underscore index
+        "1234567890123.png",         # generic ms epoch png
+    ])
+    def test_numeric_messaging_names_flagged(self, name):
+        """Pure-numeric 10–13 digit stems (WhatsApp/Messenger Unix-epoch
+        exports) must be filtered as reshared content."""
+        assert is_reshared_filename(name) is True
+
+    def test_numeric_filter_runs_with_custom_prefixes(self):
+        """Custom prefix list narrows the prefix check, but the numeric
+        pattern is universal and still applies."""
+        assert is_reshared_filename(
+            "1568579433476.jpg", prefixes=["custom_"]
+        ) is True
+
+    @pytest.mark.parametrize("name", [
         "IMG_20190303_194319.jpg",   # legit Android camera
         "IMG_1234.HEIC",             # legit iOS camera
         "DSC00123.JPG",              # legit DSLR
         "PXL_20240101_103000.jpg",   # legit Pixel camera
         "vacation.jpg",
+        "20190518152454.jpg",        # 14-digit YYYYMMDDHHMMSS — real timestamp
+        "12345.jpg",                 # 5-digit frame counter
+        "IMG_1568579433476.jpg",     # numeric body but has IMG_ prefix
     ])
     def test_regular_names_not_flagged(self, name):
         assert is_reshared_filename(name) is False
@@ -378,3 +428,332 @@ class TestAssessReshared:
                 filter_home_private=False,
             )
         assert result is False
+
+
+class TestReassessFromCache:
+    """Cache reassessment must (a) revoke stale CLIP false-positives on photos
+    that look like real photos, and (b) preserve flags it cannot recompute
+    from cache (notably is_screenshot, which needs original image dims)."""
+
+    def _make_db(self, tmp_path):
+        from src import database
+
+        db_path = str(tmp_path / "test.sqlite")
+        database.init_db(db_path)
+        return db_path
+
+    def _insert(
+        self, conn, path, *, is_private, clip_emb=None,
+        camera_model="", has_gps=0, face_count=0,
+    ):
+        from src import database
+
+        emb_blob = database.emb_to_blob(
+            clip_emb if clip_emb is not None else np.ones(512, dtype=np.float32)
+        )
+        conn.execute(
+            "INSERT INTO photos (path, file_hash, is_private, clip_emb, "
+            "camera_model, has_gps, face_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (path, "h_" + path, is_private, emb_blob,
+             camera_model, has_gps, face_count),
+        )
+
+    def _reassess(self, conn):
+        from src.privacy import reassess_is_private_from_cache
+
+        # Patch every CLIP/text gate to "negative" so the cache-recomputable
+        # signal is unambiguously False; tests then exercise the prev/preserve
+        # branch without flakiness from real CLIP scoring.
+        with patch("src.privacy.is_document_from_embedding", return_value=False), \
+             patch("src.privacy.is_text_heavy_from_embedding", return_value=False), \
+             patch("src.privacy.is_boring_from_embedding", return_value=False), \
+             patch("src.privacy.is_intimate_from_embedding", return_value=False):
+            return reassess_is_private_from_cache(conn)
+
+    def test_revokes_stale_flag_on_photo_with_camera_model(self, tmp_path):
+        """A previously-flagged photo with a real camera model must be cleared."""
+        from src import database
+
+        db_path = self._make_db(tmp_path)
+        with database.connect(db_path) as conn:
+            self._insert(conn, "/p/iphone.jpg", is_private=1,
+                         camera_model="iPhone 15", has_gps=0, face_count=0)
+            conn.commit()
+            self._reassess(conn)
+            row = conn.execute(
+                "SELECT is_private FROM photos WHERE path=?",
+                ("/p/iphone.jpg",),
+            ).fetchone()
+        assert row["is_private"] == 0
+
+    def test_revokes_stale_flag_on_photo_with_gps(self, tmp_path):
+        from src import database
+
+        db_path = self._make_db(tmp_path)
+        with database.connect(db_path) as conn:
+            self._insert(conn, "/p/gps.jpg", is_private=1,
+                         camera_model="", has_gps=1, face_count=0)
+            conn.commit()
+            self._reassess(conn)
+            row = conn.execute(
+                "SELECT is_private FROM photos WHERE path=?",
+                ("/p/gps.jpg",),
+            ).fetchone()
+        assert row["is_private"] == 0
+
+    def test_revokes_stale_flag_on_photo_with_faces(self, tmp_path):
+        from src import database
+
+        db_path = self._make_db(tmp_path)
+        with database.connect(db_path) as conn:
+            self._insert(conn, "/p/portrait.jpg", is_private=1,
+                         camera_model="", has_gps=0, face_count=2)
+            conn.commit()
+            self._reassess(conn)
+            row = conn.execute(
+                "SELECT is_private FROM photos WHERE path=?",
+                ("/p/portrait.jpg",),
+            ).fetchone()
+        assert row["is_private"] == 0
+
+    def test_preserves_flag_when_no_real_photo_signal(self, tmp_path):
+        """Likely-screenshot rows (no camera, no GPS, no faces) keep their
+        prior flag. Original image dims aren't in cache, so we can't
+        re-run is_screenshot — preservation is the safe fallback."""
+        from src import database
+
+        db_path = self._make_db(tmp_path)
+        with database.connect(db_path) as conn:
+            self._insert(conn, "/p/screenshot.png", is_private=1,
+                         camera_model="", has_gps=0, face_count=0)
+            conn.commit()
+            self._reassess(conn)
+            row = conn.execute(
+                "SELECT is_private FROM photos WHERE path=?",
+                ("/p/screenshot.png",),
+            ).fetchone()
+        assert row["is_private"] == 1
+
+    def test_clean_photos_remain_clean(self, tmp_path):
+        """Photos that were never flagged stay unflagged regardless of signals."""
+        from src import database
+
+        db_path = self._make_db(tmp_path)
+        with database.connect(db_path) as conn:
+            self._insert(conn, "/p/clean.jpg", is_private=0,
+                         camera_model="", has_gps=0, face_count=0)
+            conn.commit()
+            self._reassess(conn)
+            row = conn.execute(
+                "SELECT is_private FROM photos WHERE path=?",
+                ("/p/clean.jpg",),
+            ).fetchone()
+        assert row["is_private"] == 0
+
+    def test_clip_hit_overrides_real_photo_signals(self, tmp_path):
+        """A photo with strong real-photo signals still gets flagged when a
+        current CLIP rule fires (e.g. text-heavy)."""
+        from src import database
+        from src.privacy import reassess_is_private_from_cache
+
+        db_path = self._make_db(tmp_path)
+        with database.connect(db_path) as conn:
+            self._insert(conn, "/p/quote_meme.jpg", is_private=0,
+                         camera_model="iPhone", has_gps=1, face_count=0)
+            conn.commit()
+            with patch("src.privacy.is_document_from_embedding", return_value=False), \
+                 patch("src.privacy.is_text_heavy_from_embedding", return_value=True), \
+                 patch("src.privacy.is_boring_from_embedding", return_value=False), \
+                 patch("src.privacy.is_intimate_from_embedding", return_value=False):
+                reassess_is_private_from_cache(conn)
+            row = conn.execute(
+                "SELECT is_private FROM photos WHERE path=?",
+                ("/p/quote_meme.jpg",),
+            ).fetchone()
+        assert row["is_private"] == 1
+
+
+class TestTextHeavyFromEmbedding:
+    """Per-variant binary softmax must catch any text-heavy variant a real
+    photo doesn't, while staying conservative on real photos."""
+
+    def _patched_features(self, scores_by_variant: list[float], baseline: float):
+        """Build a torch-mock that returns softmax probabilities for each
+        binary (variant_i, baseline) pair derived from the supplied scores.
+
+        Each per-variant binary softmax is computed in the function under
+        test from ``image @ pair.T * 100``. We mock the whole CLIP pipeline
+        instead — return canned text features and pretend ``image_tensor @
+        pair.T`` yields raw logits we control via the inputs.
+        """
+        import torch
+
+        n_variants = len(_TEXT_HEAVY_PROMPTS)
+        assert len(scores_by_variant) == n_variants
+
+        # Build (n_variants + 1) text features. Each row is unit-norm.
+        # We construct features so that <image, variant_i> == score_i and
+        # <image, baseline> == baseline_score.
+        # Trick: pick image = e0 (first basis vector), variant_i has
+        # value `score_i` in dim 0 (and tiny noise elsewhere to be unit-norm).
+        dim = 8
+        image = np.zeros(dim, dtype=np.float32)
+        image[0] = 1.0
+
+        feats = np.zeros((n_variants + 1, dim), dtype=np.float32)
+        for i, s in enumerate(scores_by_variant):
+            feats[i, 0] = s
+            # Pad with epsilon to avoid divide-by-zero on norm; normalise.
+            feats[i, 1] = max(0.0, 1.0 - abs(s)) ** 0.5
+        feats[-1, 0] = baseline
+        feats[-1, 1] = max(0.0, 1.0 - abs(baseline)) ** 0.5
+        # Normalise each row.
+        feats = feats / np.linalg.norm(feats, axis=1, keepdims=True)
+
+        text_feats = torch.tensor(feats)
+
+        return image, text_feats
+
+    def test_real_photo_does_not_trigger(self):
+        """All variants score below baseline → max binary prob < 0.55."""
+        image, feats = self._patched_features(
+            scores_by_variant=[0.20, 0.18, 0.15, 0.22, 0.10, 0.05],
+            baseline=0.40,
+        )
+        with patch(
+            "src.privacy._get_text_heavy_features",
+            return_value=(feats, None, None, "cpu"),
+        ):
+            assert is_text_heavy_from_embedding(image) is False
+
+    def test_printed_page_variant_triggers(self):
+        """Camera shot of a printed page: dominant variant is index 1
+        (``a photo of a printed page, document, notebook, or letter``).
+        Old single-prompt design only checked variant 0 (chat) and missed
+        this; per-variant softmax catches it."""
+        scores = [0.10, 0.95, 0.10, 0.10, 0.10, 0.10]  # variant 1 dominates
+        image, feats = self._patched_features(
+            scores_by_variant=scores, baseline=0.05
+        )
+        with patch(
+            "src.privacy._get_text_heavy_features",
+            return_value=(feats, None, None, "cpu"),
+        ):
+            assert is_text_heavy_from_embedding(image) is True
+
+    def test_calendar_page_variant_triggers(self):
+        """Camera shot of a calendar/schedule (variant 2)."""
+        scores = [0.10, 0.10, 0.95, 0.10, 0.10, 0.10]
+        image, feats = self._patched_features(
+            scores_by_variant=scores, baseline=0.05
+        )
+        with patch(
+            "src.privacy._get_text_heavy_features",
+            return_value=(feats, None, None, "cpu"),
+        ):
+            assert is_text_heavy_from_embedding(image) is True
+
+    def test_chat_screenshot_still_triggers(self):
+        """Backwards-compat: chat screenshot (variant 0) still works."""
+        scores = [0.95, 0.10, 0.10, 0.10, 0.10, 0.10]
+        image, feats = self._patched_features(
+            scores_by_variant=scores, baseline=0.05
+        )
+        with patch(
+            "src.privacy._get_text_heavy_features",
+            return_value=(feats, None, None, "cpu"),
+        ):
+            assert is_text_heavy_from_embedding(image) is True
+
+    def test_threshold_respected(self):
+        """A variant scoring just below the threshold must NOT trigger."""
+        # Pair (0.50, 0.50) → binary softmax ≈ 0.5; below 0.55 default.
+        scores = [0.50, 0.10, 0.10, 0.10, 0.10, 0.10]
+        image, feats = self._patched_features(
+            scores_by_variant=scores, baseline=0.50
+        )
+        with patch(
+            "src.privacy._get_text_heavy_features",
+            return_value=(feats, None, None, "cpu"),
+        ):
+            assert is_text_heavy_from_embedding(image) is False
+
+    def test_none_embedding_returns_false(self):
+        assert is_text_heavy_from_embedding(None) is False
+
+
+class TestAssessStructuralBackstop:
+    """assess() must use the structural document-page check to catch
+    camera photos of printed pages that CLIP misses (the user-reported
+    IMG_20190125_110258.jpg case — Android camera filename, real EXIF,
+    text-heavy content)."""
+
+    def test_structural_backstop_flags_text_document(self):
+        img = _img((1920, 1080))
+        with patch("src.privacy.is_document_from_embedding", return_value=False), \
+             patch("src.privacy.is_text_heavy_from_embedding", return_value=False), \
+             patch("src.privacy.is_boring_from_embedding", return_value=False), \
+             patch("src.privacy.is_intimate_from_embedding", return_value=False), \
+             patch("src.privacy.looks_like_text_document_page", return_value=True):
+            result = assess(
+                img=img,
+                camera_model="Xiaomi Redmi",
+                has_gps=False,
+                lat=0.0, lon=0.0, face_count=0,
+                home=None, home_radius_km=0.5,
+                filter_screenshots=True,
+                filter_documents=True,
+                filter_text_heavy=True,
+                filter_home_private=False,
+                path="IMG_20190125_110258.jpg",
+                clip_emb=np.zeros(512, dtype=np.float32),
+            )
+        assert result is True
+
+    def test_structural_backstop_does_not_flag_normal_photo(self):
+        """When the structural check returns False, a normal photo with
+        no other CLIP/filter hits stays unflagged."""
+        img = _img((1920, 1080))
+        with patch("src.privacy.is_document_from_embedding", return_value=False), \
+             patch("src.privacy.is_text_heavy_from_embedding", return_value=False), \
+             patch("src.privacy.is_boring_from_embedding", return_value=False), \
+             patch("src.privacy.is_intimate_from_embedding", return_value=False), \
+             patch("src.privacy.looks_like_text_document_page", return_value=False):
+            result = assess(
+                img=img,
+                camera_model="Xiaomi Redmi",
+                has_gps=False,
+                lat=0.0, lon=0.0, face_count=0,
+                home=None, home_radius_km=0.5,
+                filter_screenshots=True,
+                filter_documents=True,
+                filter_text_heavy=True,
+                filter_home_private=False,
+                path="IMG_20190125_110258.jpg",
+                clip_emb=np.zeros(512, dtype=np.float32),
+            )
+        assert result is False
+
+    def test_structural_backstop_disabled_when_text_heavy_off(self):
+        """Both the CLIP text-heavy gate and the structural backstop are
+        controlled by ``filter_text_heavy``. Off → neither runs."""
+        img = _img((1920, 1080))
+        with patch("src.privacy.is_document_from_embedding", return_value=False), \
+             patch("src.privacy.is_boring_from_embedding", return_value=False), \
+             patch("src.privacy.is_intimate_from_embedding", return_value=False), \
+             patch("src.privacy.looks_like_text_document_page", return_value=True) as struct:
+            result = assess(
+                img=img,
+                camera_model="Xiaomi Redmi",
+                has_gps=False,
+                lat=0.0, lon=0.0, face_count=0,
+                home=None, home_radius_km=0.5,
+                filter_screenshots=True,
+                filter_documents=True,
+                filter_text_heavy=False,
+                filter_home_private=False,
+                path="IMG_20190125_110258.jpg",
+                clip_emb=np.zeros(512, dtype=np.float32),
+            )
+        assert result is False
+        struct.assert_not_called()
