@@ -70,7 +70,7 @@ class TestFaceScore:
 
 class TestDetect:
     def test_exception_returns_zero_none(self):
-        """If MTCNN raises, detect returns (0, None)."""
+        """If MTCNN raises, detect returns empty face data."""
         img = Image.new("RGB", (100, 100))
 
         mock_mtcnn = MagicMock()
@@ -81,13 +81,15 @@ class TestDetect:
              patch.object(fd_mod, "_device", MagicMock()), \
              patch("src.face_detection.load_models",
                    return_value=(mock_mtcnn, MagicMock(), MagicMock())):
-            count, emb = fd_mod.detect(img)
+            count, emb, prominence, confidence = fd_mod.detect(img)
 
         assert count == 0
         assert emb is None
+        assert prominence == 0.0
+        assert confidence == 0.0
 
     def test_no_faces_returns_zero_none(self):
-        """If MTCNN returns None (no faces), detect returns (0, None)."""
+        """If MTCNN returns None (no faces), detect returns empty face data."""
         img = Image.new("RGB", (100, 100))
 
         mock_mtcnn = MagicMock(return_value=None)
@@ -96,7 +98,9 @@ class TestDetect:
 
         with patch("src.face_detection.load_models",
                    return_value=(mock_mtcnn, mock_facenet, mock_device)):
-            count, emb = fd_mod.detect(img)
+            count, emb, prominence, confidence = fd_mod.detect(img)
 
         assert count == 0
         assert emb is None
+        assert prominence == 0.0
+        assert confidence == 0.0
