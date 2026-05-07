@@ -40,6 +40,21 @@ _MIN_FACE_AREA_FRAC: float = 0.005
 # FaceNet input size — same as the MTCNN crop size used by facenet-pytorch.
 _FACENET_INPUT: int = 160
 
+# Bumped whenever ``detect()``'s output semantics change in a way that makes
+# previously-stored ``face_emb`` blobs incompatible with new ones written
+# by the same code path. Compared against the per-row ``face_emb_version``
+# column in SQLite — rows below the current version are re-extracted by
+# ``main.stage_refresh_face_embeddings`` before face clustering runs.
+#
+# History:
+#   0  Legacy (pre-versioning): suffered (a) Pass-2 crop/box-order mismatch
+#      that embedded background bystanders in multi-face photos, and (b)
+#      mean-of-N FaceNet averaging that produced chimera embeddings for
+#      group photos.
+#   1  Current: manual cropping from valid_boxes (fixes a) + largest-face
+#      embedding only (fixes b).
+FACE_EMB_VERSION: int = 1
+
 # Process-level counter of detect() failures that fell back to "no faces".
 # A non-zero value at stage end means face/identity signals are missing for
 # those photos — surface it via ``detect_failure_count``.
@@ -162,34 +177,34 @@ def detect(
         # earlier in detection order than a qualifying box.
         # Instead, manually crop the qualifying boxes from the original
         # image and resize to FaceNet's expected input.
-        crops = []
-        for box in valid_boxes:
-            x1, y1, x2, y2 = (int(round(c)) for c in box)
-            x1 = max(0, x1); y1 = max(0, y1)
-            x2 = min(img_w, x2); y2 = min(img_h, y2)
-            if x2 - x1 < 2 or y2 - y1 < 2:
-                continue
-            crop = img.crop((x1, y1, x2, y2)).resize(
-                (_FACENET_INPUT, _FACENET_INPUT), Image.BILINEAR
-            )
-            arr = np.asarray(crop, dtype=np.float32)  # (H, W, 3) in [0, 255]
-            crops.append(arr)
-
-        if not crops:
+        
+        # To avoid averaging multiple faces (which creates an invalid embedding
+        # that doesn't cluster with any individual person), we extract the
+        # embedding of the largest (most prominent) face to represent the photo.
+        best_box = max(valid_boxes, key=lambda b: max(0.0, float(b[2] - b[0])) * max(0.0, float(b[3] - b[1])))
+        x1, y1, x2, y2 = (int(round(c)) for c in best_box)
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(img_w, x2); y2 = min(img_h, y2)
+        if x2 - x1 < 2 or y2 - y1 < 2:
             return face_count, None, face_prominence, face_confidence
+            
+        crop = img.crop((x1, y1, x2, y2)).resize(
+            (_FACENET_INPUT, _FACENET_INPUT), Image.BILINEAR
+        )
+        arr = np.asarray(crop, dtype=np.float32)  # (H, W, 3) in [0, 255]
 
-        # (N, H, W, 3) → (N, 3, H, W) for PyTorch
-        batch = np.stack(crops, axis=0).transpose(0, 3, 1, 2)
+        # (H, W, 3) → (1, 3, H, W) for PyTorch
+        batch = np.expand_dims(arr, axis=0).transpose(0, 3, 1, 2)
         faces_tensor = torch.from_numpy(batch)
         # Pixel range (0–255) → normalised to [-1, 1] for FaceNet
         faces_norm = (faces_tensor / 127.5) - 1.0
         faces_norm = faces_norm.to(device)
 
         with torch.no_grad():
-            embedding_vecs = facenet(faces_norm)  # (N, 512)
+            embedding_vecs = facenet(faces_norm)  # (1, 512)
 
-        avg_emb = embedding_vecs.mean(dim=0).cpu().numpy().astype(np.float32)
-        return face_count, avg_emb, face_prominence, face_confidence
+        emb = embedding_vecs[0].cpu().numpy().astype(np.float32)
+        return face_count, emb, face_prominence, face_confidence
 
     except (RuntimeError, ValueError, OSError, MemoryError) as exc:
         global _detect_failure_count

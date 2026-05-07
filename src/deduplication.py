@@ -175,7 +175,12 @@ def find_duplicates_ann(
         # 2. ANN CLIP search  (O(log N) query, O(K) candidate check)
         if not is_dup and accepted_paths:
             emb = rec.get("clip_emb")
-            if emb is not None:
+            # Stale zero-vec blobs from previous failed extractions can sit
+            # in SQLite even though the vector store now refuses them at the
+            # boundary. ChromaDB cosine distance with a zero-norm query is
+            # implementation-defined (NaN, garbage neighbours, or raise) —
+            # short-circuit before search_clip and let pHash/exact-hash run.
+            if emb is not None and float(np.linalg.norm(emb)) >= 1e-6:
                 try:
                     candidates = store.search_clip(emb, n_results=ann_k)
                 except (RuntimeError, ValueError, OSError) as exc:

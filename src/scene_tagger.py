@@ -111,7 +111,7 @@ def classify(
         _build_label_features()
 
         emb = clip_emb / (np.linalg.norm(clip_emb) + 1e-8)
-        logits = emb @ _label_features.T  # (N_labels,)
+        logits = (emb @ _label_features.T) * 100.0  # (N_labels,)
 
         # Softmax
         e = np.exp(logits - logits.max())
