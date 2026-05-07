@@ -5,11 +5,14 @@ Schema designed for append-heavy workloads with incremental updates.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from typing import Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +68,11 @@ def init_db(db_path: str) -> None:
                 scene_tags      TEXT    DEFAULT '',
                 smile_score     REAL    DEFAULT 0.5,
                 person_id       INTEGER DEFAULT -1,
-                is_frequent     INTEGER DEFAULT 0
+                is_frequent     INTEGER DEFAULT 0,
+                -- Version of the face-detection code that produced face_emb;
+                -- bumped on output-semantic changes so legacy chimera/
+                -- misaligned embeddings can be detected and refreshed.
+                face_emb_version INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_hash    ON photos(file_hash);
             CREATE INDEX IF NOT EXISTS idx_cluster ON photos(cluster_id);
@@ -80,6 +87,10 @@ def init_db(db_path: str) -> None:
         _add_column_if_missing(conn, "photos", "is_frequent",      "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "photos", "face_prominence",  "REAL DEFAULT 0")
         _add_column_if_missing(conn, "photos", "face_confidence",  "REAL DEFAULT 0")
+        # face_emb_version=0 marks legacy rows whose face_emb predates the
+        # combined crop-alignment + largest-face fixes. main.stage_refresh_
+        # face_embeddings re-extracts those rows on the next pipeline run.
+        _add_column_if_missing(conn, "photos", "face_emb_version", "INTEGER DEFAULT 0")
 
 
 def _add_column_if_missing(
@@ -191,4 +202,25 @@ def emb_to_blob(arr: Optional[np.ndarray]) -> Optional[bytes]:
 
 
 def blob_to_emb(blob: Optional[bytes]) -> Optional[np.ndarray]:
-    return None if not blob else np.frombuffer(blob, dtype=np.float32).copy()
+    """Decode a stored CLIP / face embedding blob.
+
+    Returns ``None`` for missing or corrupted blobs. ``np.frombuffer`` raises
+    ``ValueError`` when the byte length isn't a multiple of float32 size —
+    which can happen on disk corruption or after a schema migration that
+    wrote non-float32 data. Treat both as "no embedding" so callers don't
+    need to wrap every decode site in their own try/except (and so a single
+    corrupt row doesn't take down a whole stage).
+    """
+    if not blob:
+        return None
+    if len(blob) % 4 != 0:
+        logger.warning(
+            "Refusing to decode embedding blob: %d bytes is not a multiple "
+            "of float32 size (likely corruption).", len(blob),
+        )
+        return None
+    try:
+        return np.frombuffer(blob, dtype=np.float32).copy()
+    except ValueError as exc:
+        logger.warning("blob_to_emb decode failed (%d bytes): %s", len(blob), exc)
+        return None

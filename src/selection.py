@@ -170,9 +170,23 @@ def select_photos(
     if subject_scores is None:
         subject_scores = {}
 
-    # Normalise bucket fractions to sum to 1.0
+    # Validate + normalise bucket fractions. A misconfigured ``buckets`` map
+    # with all-zero or negative values would otherwise silently produce an
+    # empty selection (each bucket's byte_budget multiplies by zero, no
+    # photos are admitted). Catch it at the boundary with a clear error
+    # rather than letting the run "succeed" with zero output.
+    if any(v < 0 for v in buckets.values()):
+        raise ValueError(
+            f"selection.buckets contains a negative fraction: {buckets!r}. "
+            "All bucket weights must be >= 0."
+        )
     total_frac = sum(buckets.values())
-    if total_frac > 0 and abs(total_frac - 1.0) > 1e-6:
+    if total_frac <= 0:
+        raise ValueError(
+            f"selection.buckets fractions sum to {total_frac} (must be > 0). "
+            f"At least one bucket must have a positive weight: {buckets!r}."
+        )
+    if abs(total_frac - 1.0) > 1e-6:
         buckets = {k: v / total_frac for k, v in buckets.items()}
 
     # Hard gates: duplicates and privacy-flagged photos never enter the pool.

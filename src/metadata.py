@@ -5,7 +5,7 @@ Adapted from vision-photo-clusterer with additional fields.
 
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
@@ -18,6 +18,43 @@ logger = logging.getLogger(__name__)
 # from a real 0.0° value so callers can tell "decode failure" from "Equator/
 # Greenwich". ``extract_exif`` checks for this and refuses to set has_gps.
 _DMS_DECODE_FAILED = float("nan")
+
+
+# EXIF 2.31 timezone-offset tags. ``getattr`` with fallback so we still work
+# on older piexif builds that predate the constant — the numeric tag values
+# (0x9011 / 0x9010) are stable in the EXIF spec.
+_OFFSET_TIME_ORIGINAL_TAG = getattr(piexif.ExifIFD, "OffsetTimeOriginal", 0x9011)
+_OFFSET_TIME_TAG = getattr(piexif.ExifIFD, "OffsetTime", 0x9010)
+
+
+def _parse_exif_offset(offset_bytes) -> Optional[timezone]:
+    """Convert an EXIF offset string (b"+05:30", b"-08:00") to a tzinfo.
+
+    Returns None on missing or malformed input — caller falls back to the
+    naive-datetime / local-time interpretation that EXIF defaults to.
+    """
+    if not offset_bytes:
+        return None
+    try:
+        s = offset_bytes.decode("ascii", errors="ignore").strip()
+        # Accepted forms: "+05:30", "-08:00", "+0530", "Z" (UTC).
+        if s.upper() == "Z":
+            return timezone.utc
+        m = re.fullmatch(r"([+\-])(\d{2}):?(\d{2})", s)
+        if not m:
+            return None
+        sign = 1 if m.group(1) == "+" else -1
+        hours = int(m.group(2))
+        minutes = int(m.group(3))
+        # Real EXIF offsets span -12:00 (Baker Island) to +14:00 (Kiribati);
+        # +14:01..+14:59 are out-of-spec and almost certainly garbage minute
+        # fields from buggy firmware. Reject those rather than admit a tz
+        # that would skew timestamps by up to 59 minutes.
+        if hours > 14 or (hours == 14 and minutes > 0) or minutes >= 60:
+            return None
+        return timezone(sign * timedelta(hours=hours, minutes=minutes))
+    except (ValueError, AttributeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -429,13 +466,33 @@ def extract_exif(path: Path) -> dict:
         exif_ifd.get(piexif.ExifIFD.DateTimeOriginal)
         or ifd0.get(piexif.ImageIFD.DateTime)
     )
+    # EXIF 2.31 added per-component timezone offsets ("+HH:MM" or "-HH:MM")
+    # via OffsetTimeOriginal (paired with DateTimeOriginal) and OffsetTime
+    # (paired with the 0th IFD DateTime). Without these, the DateTime field
+    # is a *naive* local-time string and ``dt.timestamp()`` would interpret
+    # it in the *processing host's* timezone — producing wrong Unix seconds
+    # (and therefore wrong day/hour cap bucketing) for any photo taken in a
+    # different timezone than the machine running the curator.
+    offset_bytes = (
+        exif_ifd.get(_OFFSET_TIME_ORIGINAL_TAG)
+        or exif_ifd.get(_OFFSET_TIME_TAG)
+    )
     if dt_bytes:
         try:
             dt_str = dt_bytes.decode("ascii", errors="ignore").strip()
             dt = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+            tz = _parse_exif_offset(offset_bytes)
+            if tz is not None:
+                dt = dt.replace(tzinfo=tz)
+            # Naive datetime falls back to local-time interpretation — this
+            # is the documented EXIF default and matches behaviour before
+            # this fix; logged at debug for forensics, not an error.
             result["timestamp"] = dt.timestamp()
-        except Exception:
-            pass
+        except (ValueError, UnicodeDecodeError) as exc:
+            logger.debug(
+                "EXIF datetime parse failed for %s (%r): %s",
+                path, dt_bytes[:32] if isinstance(dt_bytes, (bytes, bytearray)) else dt_bytes, exc,
+            )
 
     # Filename fallback — keeps temporal diversity & event clustering working
     # for files exported without EXIF (WhatsApp, screenshots, manual exports).

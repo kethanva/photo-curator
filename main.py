@@ -212,6 +212,7 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                 "face_emb": database.emb_to_blob(face_emb),
                 "face_prominence": face_prominence,
                 "face_confidence": face_confidence,
+                "face_emb_version": face_detection.FACE_EMB_VERSION,
                 "is_private": int(is_priv),
                 "processed_at": time.time(),
             })
@@ -252,6 +253,19 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
         )
 
 
+def _is_usable_embedding(emb) -> bool:
+    """True when ``emb`` is a non-empty vector with non-trivial norm.
+
+    Stale zero-norm blobs from prior failed extractions still sit in SQLite
+    even though the vector store now refuses them at the boundary. Feeding
+    them into aesthetic / scene / subject similarity math produces garbage
+    (near-uniform softmax, neutral 0.5 scores) — skip them at the call site.
+    """
+    if emb is None or len(emb) == 0:
+        return False
+    return float(np.linalg.norm(emb)) >= 1e-6
+
+
 def stage_aesthetic(cfg: dict, db_path: str) -> None:
     """Stage 3: CLIP-based aesthetic scoring from stored embeddings."""
     use_laion = cfg.get("aesthetic", {}).get("use_laion_predictor", False)
@@ -259,14 +273,23 @@ def stage_aesthetic(cfg: dict, db_path: str) -> None:
     with database.connect(db_path) as conn:
         rows = database.get_with_clip_emb(conn)
         updates = 0
+        skipped_zero = 0
         for row in rows:
             emb = database.blob_to_emb(row["clip_emb"])
+            if not _is_usable_embedding(emb):
+                skipped_zero += 1
+                continue
             score = aesthetic.score_from_embedding(emb, use_laion=use_laion)
             database.update_fields(conn, row["path"], aesthetic_score=score)
             updates += 1
         conn.commit()
 
     print(f"  Scored aesthetics for {updates} photos")
+    if skipped_zero:
+        print(
+            f"  Skipped {skipped_zero} photo(s) with zero-norm cached "
+            "embeddings (stale entries from a prior extraction failure)."
+        )
 
 
 def stage_scene(cfg: dict, db_path: str) -> None:
@@ -276,8 +299,12 @@ def stage_scene(cfg: dict, db_path: str) -> None:
     with database.connect(db_path) as conn:
         rows = database.get_with_clip_emb(conn)
         updates = 0
+        skipped_zero = 0
         for row in rows:
             emb = database.blob_to_emb(row["clip_emb"])
+            if not _is_usable_embedding(emb):
+                skipped_zero += 1
+                continue
             tags = scene_tagger.classify(emb, top_n=top_n)
             json_str = scene_tagger.tags_to_json(tags)
             database.update_fields(conn, row["path"], scene_tags=json_str)
@@ -285,6 +312,11 @@ def stage_scene(cfg: dict, db_path: str) -> None:
         conn.commit()
 
     print(f"  Tagged scenes for {updates} photos")
+    if skipped_zero:
+        print(
+            f"  Skipped {skipped_zero} photo(s) with zero-norm cached "
+            "embeddings (stale entries from a prior extraction failure)."
+        )
 
 
 def stage_sentiment(cfg: dict, db_path: str, paths) -> None:
@@ -465,6 +497,116 @@ def stage_cluster(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
     return n_events
 
 
+def stage_refresh_face_embeddings(
+    cfg: dict, db_path: str, store: "vs.VectorStore"
+) -> None:
+    """One-time migration: re-extract face embeddings for cached rows whose
+    ``face_emb_version`` predates the current ``face_detection.FACE_EMB_VERSION``.
+
+    Cleanup for two old bugs that left chimera / misaligned face_emb blobs in
+    the cache:
+      - Pass-2 crop/box-order mismatch (embedded background bystanders)
+      - Mean-of-N FaceNet averaging (chimera embedding for group photos)
+
+    Both are now fixed in ``face_detection.detect``. This stage walks rows
+    with ``face_count >= 1`` and version below current, re-loads the photo,
+    re-runs detection, and writes the new embedding to SQLite + ChromaDB.
+
+    Idempotent: subsequent runs see all rows at the current version and
+    short-circuit cheaply. Skipped photos whose source file is missing get
+    their version bumped anyway so we don't keep retrying them on every run.
+    """
+    target_version = face_detection.FACE_EMB_VERSION
+
+    with database.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT path, face_count FROM photos "
+            "WHERE face_count >= 1 "
+            "  AND COALESCE(face_emb_version, 0) < ?",
+            (target_version,),
+        ).fetchall()
+
+    if not rows:
+        print(
+            f"  Face embeddings already at v{target_version} — nothing to refresh."
+        )
+        return
+
+    print(
+        f"  Refreshing {len(rows)} legacy face embedding(s) to v{target_version} "
+        "(fixes chimera / mis-aligned crops from prior versions)…"
+    )
+
+    max_dim = cfg["ingestion"]["max_dimension"]
+    face_detection.reset_detect_failure_count()
+
+    refreshed = 0
+    missing_files = 0
+    unreadable = 0
+    COMMIT_EVERY = 100
+
+    with database.connect(db_path) as conn:
+        for i, row in enumerate(
+            tqdm(rows, desc="  Refreshing face emb", unit="img", dynamic_ncols=True)
+        ):
+            path_str = row["path"]
+            path = Path(path_str)
+
+            if not path.exists():
+                # Source file is gone — bump version anyway so we stop
+                # retrying this row on every pipeline start. The stale
+                # face_emb stays in place but is harmless: no real photo
+                # will cluster with a path that no longer exists once
+                # face_clustering reads from the vector store.
+                missing_files += 1
+                database.update_fields(
+                    conn, path_str, face_emb_version=target_version
+                )
+                continue
+
+            img, _ = ingestion.load_image_safe(path, max_dim)
+            if img is None:
+                # load_image_safe already logged + counted via its own counter
+                unreadable += 1
+                continue
+
+            face_count, face_emb, face_prom, face_conf = face_detection.detect(img)
+
+            database.update_fields(
+                conn, path_str,
+                face_count=face_count,
+                face_emb=database.emb_to_blob(face_emb),
+                face_prominence=face_prom,
+                face_confidence=face_conf,
+                face_emb_version=target_version,
+            )
+            if face_emb is not None:
+                # ``upsert_face`` overwrites the prior chimera/misaligned
+                # vector for this path. ``vector_store`` already refuses
+                # zero-norm at the boundary, so a downgraded face_count==0
+                # path keeps its stale ChromaDB row (filtered out at
+                # face_clustering query time by the SQLite face_count >= 1
+                # join, so it can't pollute identity clusters).
+                store.upsert_face(path_str, face_emb)
+            refreshed += 1
+
+            if (i + 1) % COMMIT_EVERY == 0:
+                conn.commit()
+        conn.commit()
+
+    print(
+        f"  Refreshed {refreshed} / {len(rows)} face embeddings"
+        + (f"  (missing file: {missing_files})" if missing_files else "")
+        + (f"  (unreadable: {unreadable})" if unreadable else "")
+    )
+    failed = face_detection.detect_failure_count()
+    if failed:
+        print(
+            f"  WARNING: {failed} photo(s) failed re-detection during refresh "
+            "(MTCNN/FaceNet error). Re-run later if the failure was transient."
+        )
+
+
 def stage_face_clustering(cfg: dict, db_path: str, store: "vs.VectorStore") -> None:
     """Stage 8: Cross-photo person identity clustering.
 
@@ -643,6 +785,36 @@ def run(
     input_dir  = cfg["paths"]["input"]
     output_dir = cfg["paths"]["output"]
 
+    # HARD GUARD: copy_to_output deletes everything in output_dir before
+    # writing the curated set. If output and input resolve to the same path
+    # (config typo, env var swap), every source photo would be wiped. Refuse
+    # to start the pipeline rather than rely on the unlink-failure log.
+    from pathlib import Path as _Path
+    in_resolved = _Path(input_dir).expanduser().resolve()
+    out_resolved = _Path(output_dir).expanduser().resolve()
+    if in_resolved == out_resolved:
+        raise ValueError(
+            f"Refusing to run: input and output paths resolve to the same "
+            f"directory ({in_resolved}). Pipeline output deletion would "
+            "destroy the source library. Fix paths.input or paths.output "
+            "in the config."
+        )
+    # Also block the case where output_dir is a parent/ancestor of input_dir
+    # — wiping output would still take down inputs nested inside it.
+    try:
+        in_resolved.relative_to(out_resolved)
+        raise ValueError(
+            f"Refusing to run: input directory ({in_resolved}) is nested "
+            f"inside output directory ({out_resolved}). Output cleanup "
+            "would delete the source library. Fix paths in the config."
+        )
+    except ValueError as exc:
+        # ``relative_to`` raises ValueError with text "not in subpath" when
+        # in_resolved is NOT inside out_resolved — that is the safe case.
+        # Distinguish from the explicit ValueError we raised above.
+        if "Refusing to run" in str(exc):
+            raise
+
     database.init_db(db_path)
 
     bar = "=" * 60
@@ -740,6 +912,16 @@ def run(
         # ── Stage 7: Event clustering ─────────────────────────────────
         if _stage(7, "Event clustering"):
             n_events = stage_cluster(cfg, db_path, store)
+
+        # ── Refresh stale face embeddings (always runs — cheap when up-to-date)
+        # Migrates legacy chimera/misaligned face_emb blobs to the current
+        # face_detection version BEFORE face_clustering reads them. Skipped
+        # entirely (single SQL count check) once all rows are at the current
+        # version. Must run before stage 8 so identity clustering sees clean
+        # embeddings.
+        current_stage[0] = "*/9 face-embedding refresh"
+        print("[*/9] Refreshing legacy face embeddings (if any)…")
+        stage_refresh_face_embeddings(cfg, db_path, store)
 
         # ── Stage 8: Face identity clustering ────────────────────────
         if _stage(8, "Face identity clustering"):
