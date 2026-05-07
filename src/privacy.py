@@ -11,6 +11,7 @@ The CLIP check reuses the already-loaded model from embeddings.py.
 
 from __future__ import annotations
 
+import logging
 import re
 from math import atan2, cos, radians, sin, sqrt
 from pathlib import Path
@@ -18,6 +19,8 @@ from typing import Iterable, Optional, Tuple, Union
 
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +208,8 @@ def is_text_heavy_from_embedding(
             if prob > max_text_prob:
                 max_text_prob = prob
         return max_text_prob >= threshold
-    except Exception:
+    except (RuntimeError, ValueError, OSError, MemoryError) as exc:
+        logger.warning("is_text_heavy_from_embedding failed: %s", exc)
         return False
 
 # ---------------------------------------------------------------------------
@@ -245,13 +249,21 @@ def _get_boring_features():
 
 def is_boring_from_embedding(
     clip_emb: Optional[np.ndarray],
-    threshold: float = 0.90,
+    threshold: float = 0.25,
     ratio: float = 20.0,
 ) -> bool:
     """
     CLIP check: True when image strongly looks like a mundane single object
     (door, tubelight, wall). Kept conservative because this is an exclusion
     gate, not just a ranking signal.
+
+    Gating design: the 6-way softmax (5 boring prompts + 1 normal prompt)
+    means a single class rarely tops 0.5 even for a clear winner, so the
+    primary gate here is the ratio check (best_boring must be >= ratio ×
+    normal_prob). ``threshold`` is a safety floor that rejects incoherent
+    weak-best matches; 0.25 admits a confidently dominant boring class
+    without misfiring on diffuse softmax distributions. Earlier 0.90 default
+    was effectively unreachable.
     """
     if clip_emb is None:
         return False
@@ -263,14 +275,15 @@ def is_boring_from_embedding(
         image_tensor = image_tensor / image_tensor.norm(dim=-1, keepdim=True)
         logits = (image_tensor @ text_feats.T * 100.0).softmax(dim=-1)
         probs = logits.cpu().numpy()[0]
-        
+
         normal_prob = float(probs[-1])
         best_boring = float(probs[:-1].max())
-        
+
         if best_boring <= threshold:
             return False
         return best_boring >= ratio * max(normal_prob, 1e-6)
-    except Exception:
+    except (RuntimeError, ValueError, OSError, MemoryError) as exc:
+        logger.warning("is_boring_from_embedding failed: %s", exc)
         return False
 
 
@@ -311,11 +324,16 @@ def _get_intimate_features():
 
 def is_intimate_from_embedding(
     clip_emb: Optional[np.ndarray],
-    threshold: float = 0.80,
+    threshold: float = 0.25,
     ratio: float = 20.0,
 ) -> bool:
     """
     CLIP check: True when image strongly looks like intimate/NSFW content.
+
+    Gating design matches ``is_boring_from_embedding``: 6-way softmax over
+    5 intimate prompts + 1 normal prompt. The ratio check is the primary
+    gate; ``threshold`` is a safety floor at 0.25 (previous 0.80 was
+    unreachable in practice).
     """
     if clip_emb is None:
         return False
@@ -327,14 +345,15 @@ def is_intimate_from_embedding(
         image_tensor = image_tensor / image_tensor.norm(dim=-1, keepdim=True)
         logits = (image_tensor @ text_feats.T * 100.0).softmax(dim=-1)
         probs = logits.cpu().numpy()[0]
-        
+
         normal_prob = float(probs[-1])
         best_intimate = float(probs[:-1].max())
-        
+
         if best_intimate <= threshold:
             return False
         return best_intimate >= ratio * max(normal_prob, 1e-6)
-    except Exception:
+    except (RuntimeError, ValueError, OSError, MemoryError) as exc:
+        logger.warning("is_intimate_from_embedding failed: %s", exc)
         return False
 
 
@@ -353,7 +372,13 @@ def _private_vs_normal_probs(image_emb: np.ndarray) -> Optional[np.ndarray]:
 
         logits = (image_tensor @ text_feats.T * 100.0).softmax(dim=-1)
         return logits.cpu().numpy()[0]
-    except Exception:
+    except (RuntimeError, ValueError, OSError, MemoryError) as exc:
+        # Returning None silently disables the document/private-content gate
+        # on the calling photo (callers `is_document_from_embedding` and
+        # `is_document_page_from_embedding_and_image` interpret None as "not
+        # private"). Log so an MPS OOM or model-load issue is observable
+        # instead of letting private content slip through unflagged.
+        logger.warning("_private_vs_normal_probs failed: %s", exc)
         return None
 
 
@@ -402,7 +427,8 @@ def is_document_clip(
         if probs is None:
             return False
         return _is_private_from_probs(probs, threshold, ratio)
-    except Exception:
+    except (RuntimeError, ValueError, OSError, MemoryError, ImportError) as exc:
+        logger.warning("is_document_clip failed: %s", exc)
         return False
 
 
@@ -480,7 +506,13 @@ def looks_like_text_document_page(img: Image.Image) -> bool:
                 hv_lines += 1
 
         return hv_lines >= 50
-    except Exception:
+    except Exception as exc:
+        # Document page is a privacy gate — a silent False on cv2 import
+        # error, OpenCV's own ``cv2.error`` (whose class is hidden inside
+        # the cv2 module and not safely importable here), or pixel-decoding
+        # failures would let sensitive content through. Log so any failure
+        # is observable; intentional broad catch.
+        logger.warning("looks_like_text_document_page failed: %s", exc)
         return False
 
 
@@ -647,7 +679,10 @@ def reassess_is_private_from_cache(
             )
             changed += 1
 
-    conn.commit()
+    # NOTE: commit is the caller's responsibility — this function is invoked
+    # under a ``with database.connect(...) as conn`` block in main.py which
+    # commits on clean exit. Committing here would be a redundant double-commit
+    # (and raises in stricter SQLite modes).
     return len(rows), changed
 
 

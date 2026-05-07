@@ -77,9 +77,12 @@ class TestClusterEvents:
         result = cluster_events([])
         assert result == {}
 
-    def test_single_record_gets_cluster_zero(self):
+    def test_single_record_treated_as_noise_singleton(self):
+        # One eligible photo is a singleton, not a real event cluster — must
+        # match DBSCAN's -1 noise label so ranking/selection treat it the
+        # same as any other isolated photo from the multi-record path.
         result = cluster_events([_rec("a.jpg")])
-        assert result == {"a.jpg": 0}
+        assert result == {"a.jpg": -1}
 
     def test_returns_dict_of_ints(self):
         recs = [_rec(f"{i}.jpg", timestamp=float(i * 1000)) for i in range(5)]

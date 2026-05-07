@@ -18,11 +18,14 @@ Install:
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Optional, Tuple
 
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 # Module-level singletons
 _mtcnn = None
@@ -33,6 +36,24 @@ _device = None
 _MIN_PROB: float = 0.80
 # Minimum face area as a fraction of image area
 _MIN_FACE_AREA_FRAC: float = 0.005
+
+# FaceNet input size — same as the MTCNN crop size used by facenet-pytorch.
+_FACENET_INPUT: int = 160
+
+# Process-level counter of detect() failures that fell back to "no faces".
+# A non-zero value at stage end means face/identity signals are missing for
+# those photos — surface it via ``detect_failure_count``.
+_detect_failure_count = 0
+
+
+def detect_failure_count() -> int:
+    """Number of detect() calls that failed and returned the no-face default."""
+    return _detect_failure_count
+
+
+def reset_detect_failure_count() -> None:
+    global _detect_failure_count
+    _detect_failure_count = 0
 
 
 def _select_device():
@@ -132,21 +153,36 @@ def detect(
         face_prominence = float(min(1.0, face_area / img_area))
         face_confidence = float(np.mean(valid_probs))
 
-        # ── Pass 2: face crops for FaceNet embedding ──────────────
-        faces = mtcnn(img)  # Tensor (N, 3, 160, 160) or None
+        # ── Pass 2: FaceNet embedding from manual crops of valid_boxes ──
+        # We must NOT use ``mtcnn(img)`` here: that returns crops for every
+        # box that passed MTCNN's internal min_face_size filter, which is a
+        # superset of ``valid_boxes`` (we additionally filter by _MIN_PROB
+        # and area). Slicing the first ``face_count`` of mtcnn(img)'s output
+        # is misaligned in any image where a low-prob/small box appears
+        # earlier in detection order than a qualifying box.
+        # Instead, manually crop the qualifying boxes from the original
+        # image and resize to FaceNet's expected input.
+        crops = []
+        for box in valid_boxes:
+            x1, y1, x2, y2 = (int(round(c)) for c in box)
+            x1 = max(0, x1); y1 = max(0, y1)
+            x2 = min(img_w, x2); y2 = min(img_h, y2)
+            if x2 - x1 < 2 or y2 - y1 < 2:
+                continue
+            crop = img.crop((x1, y1, x2, y2)).resize(
+                (_FACENET_INPUT, _FACENET_INPUT), Image.BILINEAR
+            )
+            arr = np.asarray(crop, dtype=np.float32)  # (H, W, 3) in [0, 255]
+            crops.append(arr)
 
-        if faces is None:
+        if not crops:
             return face_count, None, face_prominence, face_confidence
 
-        if faces.dim() == 3:
-            faces = faces.unsqueeze(0)
-
-        # Embed only up to face_count crops (skips background bystanders)
-        n_embed = min(faces.shape[0], face_count)
-        faces = faces[:n_embed]
-
+        # (N, H, W, 3) → (N, 3, H, W) for PyTorch
+        batch = np.stack(crops, axis=0).transpose(0, 3, 1, 2)
+        faces_tensor = torch.from_numpy(batch)
         # Pixel range (0–255) → normalised to [-1, 1] for FaceNet
-        faces_norm = (faces.float() / 127.5) - 1.0
+        faces_norm = (faces_tensor / 127.5) - 1.0
         faces_norm = faces_norm.to(device)
 
         with torch.no_grad():
@@ -155,7 +191,13 @@ def detect(
         avg_emb = embedding_vecs.mean(dim=0).cpu().numpy().astype(np.float32)
         return face_count, avg_emb, face_prominence, face_confidence
 
-    except Exception:
+    except (RuntimeError, ValueError, OSError, MemoryError) as exc:
+        global _detect_failure_count
+        _detect_failure_count += 1
+        logger.warning(
+            "face_detection.detect failed (img size %sx%s): %s",
+            img_w, img_h, exc,
+        )
         return 0, None, 0.0, 0.0
 
 

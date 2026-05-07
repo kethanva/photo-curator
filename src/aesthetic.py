@@ -16,9 +16,17 @@ embedding and averaged embeddings of positive/negative aesthetic prompts.
 
 from __future__ import annotations
 
+import logging
 from typing import List, Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# Set to True the first time the LAION predictor model raises during inference,
+# so we stop retrying a known-broken model on every photo. The flag is reset
+# only by reloading the process.
+_laion_poisoned = False
 
 # ---------------------------------------------------------------------------
 # Prompt bank — curated for consistent aesthetic direction
@@ -47,7 +55,10 @@ _neg_vec: Optional[np.ndarray] = None
 
 def _build_prompt_vectors() -> None:
     global _pos_vec, _neg_vec
-    if _pos_vec is not None:
+    # Both vectors are required together — the early-return must check both
+    # so a partial init (positive encoded, negative raised) doesn't leave the
+    # cache in a half-initialised state on retry.
+    if _pos_vec is not None and _neg_vec is not None:
         return
 
     import torch
@@ -65,8 +76,13 @@ def _build_prompt_vectors() -> None:
         avg = avg / avg.norm()
         return avg.cpu().numpy().astype(np.float32)
 
-    _pos_vec = _encode(_POSITIVE_PROMPTS)
-    _neg_vec = _encode(_NEGATIVE_PROMPTS)
+    # Encode both into locals first; assign module globals atomically only
+    # on full success. If the negative encode raises, we leave _pos_vec/_neg_vec
+    # untouched (both still None) so the next call retries cleanly.
+    pos_local = _encode(_POSITIVE_PROMPTS)
+    neg_local = _encode(_NEGATIVE_PROMPTS)
+    _pos_vec = pos_local
+    _neg_vec = neg_local
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +143,19 @@ def _load_laion_predictor():
 
     try:
         m = AestheticPredictor(512)
-        state = torch.load(cache_path, map_location="cpu")
+        # weights_only=True refuses arbitrary-Python deserialisation —
+        # mitigates the documented torch.load RCE vector if the cached
+        # .pth is replaced or tampered with on disk.
+        state = torch.load(cache_path, map_location="cpu", weights_only=True)
         m.load_state_dict(state, strict=False)
         m.eval()
         _laion_model = m
         return m
-    except Exception:
+    except (RuntimeError, ValueError, OSError) as exc:
+        logger.warning(
+            "LAION predictor load failed (%s); falling back to CLIP zero-shot.",
+            exc,
+        )
         return None
 
 
@@ -157,7 +180,8 @@ def score_from_embedding(
     if clip_emb is None or len(clip_emb) != 512:
         return 0.5
 
-    if use_laion:
+    global _laion_poisoned
+    if use_laion and not _laion_poisoned:
         model = _load_laion_predictor()
         if model is not None:
             try:
@@ -166,8 +190,16 @@ def score_from_embedding(
                 with torch.no_grad():
                     raw = model(x).item()  # Scale ≈ 1–10
                 return float(np.clip((raw - 1.0) / 9.0, 0.0, 1.0))
-            except Exception:
-                pass  # Fall through to CLIP zero-shot
+            except (RuntimeError, ValueError) as exc:
+                # Mark the model as poisoned so subsequent photos go straight
+                # to CLIP zero-shot instead of retrying a broken model 10k
+                # times. Logged once per process at warning level.
+                _laion_poisoned = True
+                logger.warning(
+                    "LAION predictor inference failed (%s); disabling for "
+                    "the rest of this run, falling back to CLIP zero-shot.",
+                    exc,
+                )
 
     # CLIP zero-shot approach
     try:
@@ -178,7 +210,10 @@ def score_from_embedding(
         # Map [-1, 1] diff to [0, 1]
         raw = (pos - neg + 2.0) / 4.0
         return float(np.clip(raw, 0.0, 1.0))
-    except Exception:
+    except (RuntimeError, ValueError, OSError) as exc:
+        # Aesthetic is an 18% ranking weight — silently returning 0.5 collapses
+        # the whole dimension. Log so an operator notices a dead pipeline stage.
+        logger.error("aesthetic CLIP scoring failed: %s", exc)
         return 0.5
 
 

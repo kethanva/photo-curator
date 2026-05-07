@@ -12,7 +12,18 @@ import numpy as np
 import pytest
 from PIL import Image
 
-# Stub out torch and clip before importing the module under test
+# Stub torch and clip only if they aren't already importable. When the real
+# packages exist (full venv), let them load — otherwise stubbing leaks the
+# MagicMock into ``sys.modules`` and any later test that imports torch (e.g.
+# ``src.privacy.is_text_heavy_from_embedding`` doing a lazy ``import torch``)
+# silently picks up the mock and produces wrong results.
+def _stub_if_missing(name: str, stub) -> None:
+    try:
+        __import__(name)
+    except Exception:
+        sys.modules.setdefault(name, stub)
+
+
 _torch_stub = MagicMock()
 _torch_stub.no_grad.return_value.__enter__ = lambda s, *a: None
 _torch_stub.no_grad.return_value.__exit__ = lambda s, *a: None
@@ -20,8 +31,8 @@ _torch_stub.device = MagicMock(return_value=MagicMock())
 _torch_stub.backends.mps.is_available.return_value = False
 _torch_stub.cuda.is_available.return_value = False
 
-sys.modules.setdefault("torch", _torch_stub)
-sys.modules.setdefault("clip", MagicMock())
+_stub_if_missing("torch", _torch_stub)
+_stub_if_missing("clip", MagicMock())
 
 import src.embeddings as emb_mod
 from src.embeddings import cosine_similarity

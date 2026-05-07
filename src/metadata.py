@@ -3,12 +3,21 @@ EXIF metadata extraction: timestamp, GPS, camera model.
 Adapted from vision-photo-clusterer with additional fields.
 """
 
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import piexif
+
+logger = logging.getLogger(__name__)
+
+
+# Sentinel returned by ``_dms_to_decimal`` when conversion fails — distinct
+# from a real 0.0° value so callers can tell "decode failure" from "Equator/
+# Greenwich". ``extract_exif`` checks for this and refuses to set has_gps.
+_DMS_DECODE_FAILED = float("nan")
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +372,13 @@ def _rational_to_float(value) -> float:
 
 
 def _dms_to_decimal(dms, ref: bytes) -> float:
-    """Convert degrees/minutes/seconds tuple to decimal degrees."""
+    """Convert degrees/minutes/seconds tuple to decimal degrees.
+
+    Returns ``_DMS_DECODE_FAILED`` (NaN) on a malformed EXIF GPS block so
+    the caller can distinguish "decode failed" from a real 0° coordinate
+    and refuse to set has_gps. Returning 0.0 silently was sending photos
+    to Null Island for clustering and rare-location checks.
+    """
     try:
         d = _rational_to_float(dms[0])
         m = _rational_to_float(dms[1])
@@ -372,8 +387,9 @@ def _dms_to_decimal(dms, ref: bytes) -> float:
         if ref in (b"S", b"W"):
             value = -value
         return value
-    except Exception:
-        return 0.0
+    except (TypeError, ValueError, IndexError, ZeroDivisionError) as exc:
+        logger.debug("GPS DMS decode failed (ref=%r): %s", ref, exc)
+        return _DMS_DECODE_FAILED
 
 
 def extract_exif(path: Path) -> dict:
@@ -397,7 +413,12 @@ def extract_exif(path: Path) -> dict:
 
     try:
         exif = piexif.load(str(path))
-    except Exception:
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # Bad/missing EXIF block: fall through with the zeroed default. Log
+        # so an operator can investigate why a photo lost its timestamp —
+        # silent zero-timestamps collapse temporal diversity and corrupt
+        # the per-day/per-hour caps for the entire run.
+        logger.warning("extract_exif failed for %s: %s", path, exc)
         return result
 
     # Timestamp
@@ -434,9 +455,17 @@ def extract_exif(path: Path) -> dict:
     lon_ref = gps.get(piexif.GPSIFD.GPSLongitudeRef)
 
     if lat_data and lat_ref and lon_data and lon_ref:
-        result["lat"] = _dms_to_decimal(lat_data, lat_ref)
-        result["lon"] = _dms_to_decimal(lon_data, lon_ref)
-        result["has_gps"] = True
+        import math
+        lat_val = _dms_to_decimal(lat_data, lat_ref)
+        lon_val = _dms_to_decimal(lon_data, lon_ref)
+        # Only mark has_gps when BOTH conversions succeeded. A NaN from
+        # _dms_to_decimal means a malformed rational — treating that as
+        # (0, 0) silently put corrupted photos at Null Island and made
+        # them cluster with each other.
+        if not (math.isnan(lat_val) or math.isnan(lon_val)):
+            result["lat"] = lat_val
+            result["lon"] = lon_val
+            result["has_gps"] = True
 
     return result
 

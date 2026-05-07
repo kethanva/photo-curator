@@ -39,11 +39,21 @@ Config shape (config.yaml):
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from src import database
+
+logger = logging.getLogger(__name__)
+
+# CLIP's text encoder accepts up to 77 BPE tokens. Roughly: 1 token ≈ 4 chars
+# of English text, but punctuation and unusual words can push the ratio
+# higher. We pre-trim very long custom prompts to a safe character bound so
+# `clip.tokenize` doesn't raise on a single user-supplied subject prompt
+# and crash the entire ranking stage. 250 chars is a comfortable margin.
+_MAX_PROMPT_CHARS = 250
 
 # ---------------------------------------------------------------------------
 # Built-in subject vocabulary
@@ -319,8 +329,13 @@ def _build_vectors(subjects: List[dict]) -> None:
     """
     Encode all configured subjects into CLIP text direction vectors.
     Only subjects not already cached are processed.
+
+    Robust to per-subject failures: a bad prompt (too long for the 77-token
+    CLIP context, broken Unicode, etc.) is skipped with a warning rather
+    than crashing the entire ranking stage after eight other stages have
+    completed.
     """
-    missing = [s for s in subjects if s["name"] not in _cache]
+    missing = [s for s in subjects if s.get("name") and s["name"] not in _cache]
     if not missing:
         return
 
@@ -339,13 +354,28 @@ def _build_vectors(subjects: List[dict]) -> None:
         if not prompts:
             continue
 
-        tokens = clip.tokenize(prompts).to(device)
-        with torch.no_grad():
-            feats = model.encode_text(tokens)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-        direction = feats.mean(dim=0)
-        direction = direction / direction.norm()
-        _cache[name] = (priority, direction.cpu().numpy().astype(np.float32))
+        # Truncate over-long prompts before tokenisation so a single bad
+        # config entry can't crash the stage with a CLIP context overflow.
+        safe_prompts = [str(p)[:_MAX_PROMPT_CHARS] for p in prompts]
+
+        try:
+            tokens = clip.tokenize(safe_prompts).to(device)
+            with torch.no_grad():
+                feats = model.encode_text(tokens)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            direction = feats.mean(dim=0)
+            direction = direction / direction.norm()
+            _cache[name] = (
+                priority, direction.cpu().numpy().astype(np.float32)
+            )
+        except (RuntimeError, ValueError, OSError, MemoryError) as exc:
+            # Skip this subject — its bucket will simply score 0 for every
+            # photo. Other subjects continue to load. Logged at warning so
+            # an operator can fix the offending prompt in config.yaml.
+            logger.warning(
+                "Subject '%s' could not be encoded (%s); bucket disabled "
+                "for this run.", name, exc,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -375,8 +405,16 @@ def compute_scores(
     if not _cache:
         return {r["path"]: 0.0 for r in records}
 
-    # Stack priority weights and direction matrix from cache
-    active = [(n, p, v) for n, (p, v) in _cache.items()]
+    # Stack priority weights and direction matrix — restricted to the names
+    # in the current ``subjects_cfg``. Without this filter, _cache (which is
+    # module-level and accumulates across calls) would let a previous call's
+    # subjects bleed into this call's scoring matrix.
+    requested = {s["name"] for s in subjects}
+    active = [
+        (n, p, v) for n, (p, v) in _cache.items() if n in requested
+    ]
+    if not active:
+        return {r["path"]: 0.0 for r in records}
     priorities = np.array([p for _, p, _ in active], dtype=np.float32)    # (S,)
     directions = np.stack([v for _, _, v in active], axis=0)               # (S, 512)
 

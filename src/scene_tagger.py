@@ -10,9 +10,12 @@ nature, social events, and daily life.
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Scene vocabulary
@@ -120,7 +123,10 @@ def classify(
             for i in top_idx
             if probs[i] >= min_confidence
         ]
-    except Exception:
+    except (RuntimeError, ValueError, OSError) as exc:
+        # Empty tags silently routes the scene bucket's budget into aesthetic.
+        # Log so the operator can investigate (CLIP load issue, MPS error).
+        logger.error("scene_tagger.classify failed: %s", exc)
         return []
 
 
@@ -143,5 +149,9 @@ def tags_from_json(s: str) -> List[Tuple[str, float]]:
         return []
     try:
         return [(d["label"], d["confidence"]) for d in json.loads(s)]
-    except Exception:
+    except (ValueError, KeyError, TypeError) as exc:
+        # Cached row predates the current scene_tags JSON shape — treat as
+        # untagged. Logged at debug level since it's expected during a
+        # schema/format migration window.
+        logger.debug("scene_tags JSON parse failed (%s): %r", exc, s[:80])
         return []

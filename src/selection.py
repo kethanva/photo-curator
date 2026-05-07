@@ -24,7 +24,9 @@ Output resizing:
 
 from __future__ import annotations
 
+import bisect
 import json
+import logging
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -32,6 +34,17 @@ from typing import Dict, List, Optional, Set
 
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
+
+from src.bucket_fillers import (
+    backfill_round_robin,
+    fill_aesthetic_bucket,
+    fill_location_bucket,
+    fill_people_bucket,
+    fill_stratified_spread,
+    fill_subject_bucket,
+)
 
 
 # Built-in bucket names with special selection logic
@@ -63,8 +76,15 @@ def _resize_and_save(
                 )
             img.save(dst, "JPEG", quality=quality, optimize=True)
         return True
-    except Exception as exc:
-        print(f"  Warning: could not resize {src.name}: {exc}")
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        # DecompressionBombError inherits from Exception (not OSError), so
+        # it must be listed explicitly — large panoramas and RAW-converted
+        # TIFFs can exceed PIL's ~356MP threshold and would otherwise
+        # propagate uncaught and abort the entire output-write loop.
+        # Route through the module logger so non-interactive runs (cron,
+        # pipes) still capture the failure. ``print`` to stdout is dropped
+        # in those contexts and a missing output photo would have no trail.
+        logger.warning("could not resize %s → %s: %s", src, dst, exc)
         return False
 
 
@@ -363,6 +383,10 @@ def select_photos(
     )
     selected_paths: Set[str] = set()
     selected: List[dict] = []
+    # Parallel sorted list of selected timestamps (only for photos with
+    # ts > 0). Maintained by ``_add`` so ``_too_close_globally`` can use
+    # bisect for O(log k) lookup instead of scanning every selected record.
+    selected_timestamps: List[float] = []
     used_bytes: int = 0
     hour_counts: Dict[int, int] = defaultdict(int)
     day_counts: Dict[int, int] = defaultdict(int)
@@ -371,16 +395,28 @@ def select_photos(
         """True when ``ts`` falls within global_min_gap_seconds of any already-
         selected photo's timestamp, regardless of cluster_id.
 
-        This is the cross-cluster / noise-singleton guard. The per-cluster
-        dynamic spacing only fires for photos in the same DBSCAN cluster
-        (cid >= 0); burst shots that split into adjacent clusters or land in
-        noise (cid == -1) escape it. This check catches both cases.
+        Cross-cluster / noise-singleton guard. The per-cluster dynamic
+        spacing only fires for photos in the same DBSCAN cluster (cid >= 0);
+        burst shots that split into adjacent clusters or land in noise
+        (cid == -1) escape it. This check catches both cases.
+
+        Uses bisect for O(log k) lookup against ``selected_timestamps`` —
+        the previous linear scan was a 600M-iteration cliff at 10k+
+        selected photos on large libraries.
         """
         if global_min_gap_seconds <= 0 or ts <= 0:
             return False
-        for sel_rec in selected:
-            sel_ts = sel_rec.get("timestamp", 0) or 0
-            if sel_ts > 0 and abs(ts - sel_ts) < global_min_gap_seconds:
+        if not selected_timestamps:
+            return False
+        idx = bisect.bisect_left(selected_timestamps, ts)
+        # Check the two nearest neighbours: the one at the insertion point
+        # (>= ts) and the one just before it (< ts). If either falls
+        # within the gap window, reject.
+        if idx < len(selected_timestamps):
+            if selected_timestamps[idx] - ts < global_min_gap_seconds:
+                return True
+        if idx > 0:
+            if ts - selected_timestamps[idx - 1] < global_min_gap_seconds:
                 return True
         return False
 
@@ -429,6 +465,11 @@ def select_photos(
         selected_paths.add(rec["path"])
         selected.append(rec)
         used_bytes += est
+        # Keep the sorted timestamp index in sync so _too_close_globally
+        # can use bisect on the next call. Only photos with a real ts > 0
+        # contribute to the proximity check.
+        if ts > 0:
+            bisect.insort(selected_timestamps, ts)
         if max_per_day_n is not None:
             day_counts[_day_key(rec)] += 1
         if max_per_hour_n is not None:
@@ -470,15 +511,15 @@ def select_photos(
         )
 
         if bucket_name == "people":
-            _fill_people_bucket(
-                sorted_cands, _add, _budget_exhausted, _est_size,
+            fill_people_bucket(
+                sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
                 person_counts, max_per_person_n,
                 cluster_counts, _cluster_capped,
                 bucket_byte_budget, bucket_photo_cap,
             )
 
         elif bucket_name == "location":
-            _fill_location_bucket(
+            fill_location_bucket(
                 sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
                 person_counts, max_per_person_n,
                 loc_counts, max_per_location_n,
@@ -489,7 +530,7 @@ def select_photos(
         else:
             # CLIP subject bucket
             subj_scores = subject_scores.get(bucket_name, {})
-            _fill_subject_bucket(
+            fill_subject_bucket(
                 sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
                 person_counts, max_per_person_n,
                 cluster_counts, _cluster_capped,
@@ -512,7 +553,7 @@ def select_photos(
         # location/event cluster contributes at least one candidate before the
         # greedy by-score pass runs. This is what produces a real "spread"
         # across the user's timeline rather than a score-clustered output.
-        _fill_stratified_spread(
+        fill_stratified_spread(
             sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
             person_counts, max_per_person_n,
             cluster_counts, _cluster_capped,
@@ -520,7 +561,7 @@ def select_photos(
             max_per_day_n, max_per_hour_n,
             aesthetic_byte_budget, aesthetic_photo_cap,
         )
-        _fill_aesthetic_bucket(
+        fill_aesthetic_bucket(
             sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
             person_counts, max_per_person_n,
             cluster_counts, _cluster_capped,
@@ -535,19 +576,23 @@ def select_photos(
     # locations rather than piling onto already-saturated events.
     if max_photos is not None and len(selected) < max_photos:
         before_backfill = len(selected)
-        _backfill_round_robin(
-            sorted_cands, selected_paths, selected,
-            _day_key, _hour_key, day_counts, hour_counts,
-            cluster_counts, _cluster_capped,
-            person_counts, max_per_person_n,
-            max_per_day_n, max_per_hour_n,
-            max_photos, max_bytes, _est_size,
-            used_bytes_ref=lambda: used_bytes,
-            too_close_globally=_too_close_globally,
+        backfill_round_robin(
+            sorted_cands=sorted_cands,
+            selected_paths=selected_paths,
+            selected=selected,
+            _add=_add,
+            _day_key=_day_key,
+            day_counts=day_counts,
+            cluster_counts=cluster_counts,
+            _cluster_capped=_cluster_capped,
+            person_counts=person_counts,
+            max_per_person_n=max_per_person_n,
+            max_per_day_n=max_per_day_n,
+            max_photos=max_photos,
         )
-        # used_bytes was mutated through _add, but the round-robin path adds
-        # directly; recompute from selection to stay consistent.
-        used_bytes = sum(_est_size(r) for r in selected)
+        # _backfill_round_robin now routes every addition through _add(),
+        # which is the single source of truth for used_bytes and all
+        # diversity/spacing gates — no recompute needed.
 
         if len(selected) > before_backfill:
             print(
@@ -577,374 +622,10 @@ def select_photos(
 
 
 # ---------------------------------------------------------------------------
-# Bucket fill helpers
+# Bucket fill helpers — implemented in src/bucket_fillers.py and imported
+# at the top of this module. Kept out of this file so select_photos can
+# stay close to a readable orchestrator.
 # ---------------------------------------------------------------------------
-
-def _fill_people_bucket(
-    sorted_cands, _add, _budget_exhausted, _est_size,
-    person_counts, max_per_person_n,
-    cluster_counts, _cluster_capped,
-    byte_budget, photo_cap,
-):
-    used = 0
-    bucket_selected = 0
-    for rec in sorted_cands:
-        if _budget_exhausted():
-            break
-        if photo_cap is not None and bucket_selected >= photo_cap:
-            break
-        pid = rec.get("person_id", -1)
-        if pid < 0 or not rec.get("is_frequent", 0):
-            continue
-        if person_counts[pid] >= max_per_person_n:
-            continue
-        cid = rec.get("cluster_id", -1)
-        if _cluster_capped(cid):
-            continue
-        est = _est_size(rec)
-        if used + est > byte_budget:
-            continue
-        if _add(rec):
-            person_counts[pid] += 1
-            cluster_counts[cid] += 1
-            used += est
-            bucket_selected += 1
-
-
-def _fill_location_bucket(
-    sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
-    person_counts, max_per_person_n,
-    loc_counts, max_per_location_n,
-    cluster_counts, _cluster_capped,
-    byte_budget, photo_cap,
-):
-    used = 0
-    bucket_selected = 0
-    for rec in sorted_cands:
-        if _budget_exhausted():
-            break
-        if rec["path"] in selected_paths:
-            continue
-        cid = rec.get("cluster_id", -1)
-        if cid >= 0 and loc_counts[cid] >= max_per_location_n:
-            continue
-        if _cluster_capped(cid):
-            continue
-        pid = rec.get("person_id", -1)
-        if pid >= 0 and person_counts[pid] >= max_per_person_n:
-            continue
-        if photo_cap is not None and bucket_selected >= photo_cap:
-            continue
-        est = _est_size(rec)
-        if used + est > byte_budget:
-            continue
-        if _add(rec):
-            loc_counts[cid] += 1
-            cluster_counts[cid] += 1
-            used += est
-            bucket_selected += 1
-            if pid >= 0:
-                person_counts[pid] += 1
-
-
-def _fill_subject_bucket(
-    sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
-    person_counts, max_per_person_n,
-    cluster_counts, _cluster_capped,
-    _day_key, _hour_key, day_counts, hour_counts,
-    max_per_day_n, max_per_hour_n,
-    subj_scores, byte_budget, photo_cap,
-):
-    """Fill a CLIP subject bucket.
-
-    Candidates are sorted by their subject similarity (descending) so the
-    best matches for this subject are picked first. Day/hour caps are
-    pre-checked here (matching _fill_aesthetic_bucket) so saturated buckets
-    don't burn iterations or inflate the per-bucket photo cap on rejected
-    records.
-    """
-    # Re-sort by subject similarity for this bucket
-    subj_sorted = sorted(
-        sorted_cands,
-        key=lambda r: subj_scores.get(r["path"], 0.0),
-        reverse=True,
-    )
-
-    used = 0
-    bucket_selected = 0
-    for rec in subj_sorted:
-        if _budget_exhausted():
-            break
-        if rec["path"] in selected_paths:
-            continue
-        # Skip photos with weak subject match. 0.20 sits above the
-        # background CLIP similarity floor (~0.15–0.18 for unrelated photos)
-        # so subject buckets pull genuine matches rather than noise.
-        if subj_scores.get(rec["path"], 0.0) < 0.20:
-            break  # sorted descending — rest will be even lower
-        # Early diversity skips — saturated day/hour buckets shouldn't even
-        # be considered here.
-        if max_per_day_n is not None and day_counts[_day_key(rec)] >= max_per_day_n:
-            continue
-        if max_per_hour_n is not None and hour_counts[_hour_key(rec)] >= max_per_hour_n:
-            continue
-        pid = rec.get("person_id", -1)
-        if pid >= 0 and person_counts[pid] >= max_per_person_n:
-            continue
-        cid = rec.get("cluster_id", -1)
-        if _cluster_capped(cid):
-            continue
-        if photo_cap is not None and bucket_selected >= photo_cap:
-            break
-        est = _est_size(rec)
-        if used + est > byte_budget:
-            continue
-        if _add(rec):
-            used += est
-            bucket_selected += 1
-            cluster_counts[cid] += 1
-            if pid >= 0:
-                person_counts[pid] += 1
-
-
-def _fill_stratified_spread(
-    sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
-    person_counts, max_per_person_n,
-    cluster_counts, _cluster_capped,
-    _day_key, _hour_key, day_counts, hour_counts,
-    max_per_day_n, max_per_hour_n,
-    byte_budget, photo_cap,
-):
-    """Stratified spread pass — guarantees each distinct day AND each distinct
-    location/event cluster contributes its best-scoring candidate before the
-    greedy by-score aesthetic pass runs.
-
-    This is the positive-spread mechanism that complements the defensive caps:
-    instead of letting score-clustered candidates dominate, every timeline
-    bucket and every location bucket gets a turn.
-    """
-    used = 0
-    bucket_selected = 0
-
-    # Pass A — one best photo from each distinct day not yet represented.
-    # sorted_cands is already score-desc, so the first time we see a new
-    # day_key it's that day's top-scored candidate. Iteration order of
-    # by_day_unrepresented therefore gives days in best-first order.
-    seen_days_at_start = {d for d, c in day_counts.items() if c > 0}
-    by_day_unrepresented: Dict[int, List[dict]] = {}
-    for rec in sorted_cands:
-        if rec["path"] in selected_paths:
-            continue
-        d = _day_key(rec)
-        if d in seen_days_at_start:
-            continue
-        by_day_unrepresented.setdefault(d, []).append(rec)
-
-    for _day, queue in by_day_unrepresented.items():
-        if _budget_exhausted():
-            break
-        if photo_cap is not None and bucket_selected >= photo_cap:
-            break
-        for rec in queue:
-            if rec["path"] in selected_paths:
-                continue
-            # Enforce diversity caps before commit — otherwise spread pass
-            # silently bypasses per-person / cluster limits.
-            pid = rec.get("person_id", -1)
-            if pid >= 0 and person_counts[pid] >= max_per_person_n:
-                continue
-            cid = rec.get("cluster_id", -1)
-            if _cluster_capped(cid):
-                continue
-            est = _est_size(rec)
-            if used + est > byte_budget:
-                break
-            if _add(rec):
-                used += est
-                bucket_selected += 1
-                cluster_counts[cid] += 1
-                if pid >= 0:
-                    person_counts[pid] += 1
-                break  # one per day in this pass
-
-    # Pass B — one best photo per distinct GPS/event cluster not yet seen.
-    seen_clusters_at_start = {c for c, n in cluster_counts.items() if n > 0}
-    by_cluster_unrepresented: Dict[int, List[dict]] = {}
-    for rec in sorted_cands:
-        if rec["path"] in selected_paths:
-            continue
-        cid = rec.get("cluster_id", -1)
-        if cid < 0 or cid in seen_clusters_at_start:
-            continue
-        by_cluster_unrepresented.setdefault(cid, []).append(rec)
-
-    for _cid, queue in by_cluster_unrepresented.items():
-        if _budget_exhausted():
-            break
-        if photo_cap is not None and bucket_selected >= photo_cap:
-            break
-        for rec in queue:
-            if rec["path"] in selected_paths:
-                continue
-            pid = rec.get("person_id", -1)
-            if pid >= 0 and person_counts[pid] >= max_per_person_n:
-                continue
-            cid = rec.get("cluster_id", -1)
-            if _cluster_capped(cid):
-                continue
-            est = _est_size(rec)
-            if used + est > byte_budget:
-                break
-            if _add(rec):
-                used += est
-                bucket_selected += 1
-                cluster_counts[cid] += 1
-                if pid >= 0:
-                    person_counts[pid] += 1
-                break
-
-
-def _backfill_round_robin(
-    sorted_cands, selected_paths, selected,
-    _day_key, _hour_key, day_counts, hour_counts,
-    cluster_counts, _cluster_capped,
-    person_counts, max_per_person_n,
-    max_per_day_n, max_per_hour_n,
-    max_photos, max_bytes, _est_size,
-    used_bytes_ref,
-    too_close_globally=None,
-):
-    """Diversity-respecting backfill.
-
-    Walks distinct days in round-robin order (under-represented days first),
-    pulling each day's highest-scored remaining candidate. Day/hour/cluster/
-    person caps are enforced — we under-deliver vs target rather than collapse
-    spread. If ``too_close_globally`` is supplied it must reject candidates
-    that fall within the global temporal-proximity window of any already-
-    selected photo (the same guard ``_add`` applies).
-    """
-    # Build per-day queues from remaining candidates (already score-sorted).
-    by_day: Dict[int, List[dict]] = defaultdict(list)
-    for rec in sorted_cands:
-        if rec["path"] in selected_paths:
-            continue
-        by_day[_day_key(rec)].append(rec)
-
-    used_bytes = used_bytes_ref()
-
-    while len(selected) < max_photos:
-        # Re-order days each pass: least-represented first (true round-robin).
-        ordered_days = sorted(
-            (d for d, q in by_day.items() if q),
-            key=lambda d: (day_counts[d], -len(by_day[d])),
-        )
-        if not ordered_days:
-            break
-
-        progress = False
-        for day in ordered_days:
-            if len(selected) >= max_photos:
-                break
-
-            if max_per_day_n is not None and day_counts[day] >= max_per_day_n:
-                by_day[day].clear()
-                continue
-
-            queue = by_day[day]
-            picked = None
-            while queue:
-                rec = queue.pop(0)
-                if rec["path"] in selected_paths:
-                    continue
-
-                # Enforce caps before commit.
-                if max_per_hour_n is not None and hour_counts[_hour_key(rec)] >= max_per_hour_n:
-                    continue
-                pid = rec.get("person_id", -1)
-                if pid >= 0 and person_counts[pid] >= max_per_person_n:
-                    continue
-                cid = rec.get("cluster_id", -1)
-                if _cluster_capped(cid):
-                    continue
-                # Global temporal-proximity guard — same rule the main _add
-                # path applies. Without it the backfill bypasses spacing for
-                # noise/cross-cluster bursts.
-                if too_close_globally is not None:
-                    rec_ts = rec.get("timestamp", 0) or 0
-                    if rec_ts > 0 and too_close_globally(rec_ts):
-                        continue
-                est = _est_size(rec)
-                if used_bytes + est > max_bytes:
-                    continue
-
-                picked = rec
-                break
-
-            if picked is None:
-                continue
-
-            est = _est_size(picked)
-            selected_paths.add(picked["path"])
-            selected.append(picked)
-            used_bytes += est
-            day_counts[day] += 1
-            hour_counts[_hour_key(picked)] += 1
-            cid = picked.get("cluster_id", -1)
-            cluster_counts[cid] += 1
-            pid = picked.get("person_id", -1)
-            if pid >= 0:
-                person_counts[pid] += 1
-            progress = True
-
-        if not progress:
-            break
-
-
-def _fill_aesthetic_bucket(
-    sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
-    person_counts, max_per_person_n,
-    cluster_counts, _cluster_capped,
-    _day_key, _hour_key, day_counts, hour_counts,
-    max_per_day_n, max_per_hour_n,
-    byte_budget, photo_cap,
-):
-    """Aesthetic share — fills the remaining byte/photo budget with the
-    highest-scored remaining candidates.
-
-    Enforces every diversity cap (person, cluster, day, hour) before the
-    `_add` call so iteration doesn't bounce off saturated buckets.
-    Skipping saturated day/hour buckets early naturally promotes
-    under-represented buckets without an explicit round-robin pass.
-    """
-    used = 0
-    bucket_selected = 0
-    for rec in sorted_cands:
-        if _budget_exhausted():
-            break
-        if rec["path"] in selected_paths:
-            continue
-        if photo_cap is not None and bucket_selected >= photo_cap:
-            break
-        # Early diversity skips — avoid the wasted _add call when caps already bind.
-        if max_per_day_n is not None and day_counts[_day_key(rec)] >= max_per_day_n:
-            continue
-        if max_per_hour_n is not None and hour_counts[_hour_key(rec)] >= max_per_hour_n:
-            continue
-        pid = rec.get("person_id", -1)
-        if pid >= 0 and person_counts[pid] >= max_per_person_n:
-            continue
-        cid = rec.get("cluster_id", -1)
-        if _cluster_capped(cid):
-            continue
-        est = _est_size(rec)
-        if used + est > byte_budget:
-            continue
-        if _add(rec):
-            used += est
-            bucket_selected += 1
-            cluster_counts[cid] += 1
-            if pid >= 0:
-                person_counts[pid] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -970,13 +651,23 @@ def copy_to_output(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Clean previous output to prevent accumulating duplicates with _1 suffixes
+    # Clean previous output to prevent accumulating duplicates with _1 suffixes.
+    # PermissionError / OSError on a locked file is logged at warning level so
+    # the operator knows the output dir is dirty — silently swallowing leads
+    # to mismatched filenames between the run and the report.
+    cleanup_failures = 0
     for old_file in out.glob("*"):
         if old_file.is_file() and old_file.name != ".gitkeep":
             try:
                 old_file.unlink()
-            except Exception:
-                pass
+            except OSError as exc:
+                cleanup_failures += 1
+                logger.warning("Could not remove stale output %s: %s", old_file, exc)
+    if cleanup_failures:
+        print(
+            f"  Warning: {cleanup_failures} stale file(s) in {out} could not be "
+            "removed. Report filenames may include collision suffixes."
+        )
 
     report: List[dict] = []
     copied = 0
@@ -1008,8 +699,8 @@ def copy_to_output(
             try:
                 shutil.copy2(src, dst)
                 ok = True
-            except Exception as exc:
-                print(f"  Warning: could not copy {src.name}: {exc}")
+            except OSError as exc:
+                logger.warning("could not copy %s → %s: %s", src, dst, exc)
                 ok = False
 
         if not ok:

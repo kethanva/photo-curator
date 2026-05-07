@@ -8,14 +8,42 @@ Install CLIP:
 
 from __future__ import annotations
 
+import logging
 from typing import List, Optional, Tuple
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Module-level singletons — loaded once, reused across calls
 _model = None
 _preprocess = None
 _device = None
+
+# Process-level counter of failed extractions that fell back to zero vectors.
+# A non-zero value at stage end means dedup/clustering/selection consumed
+# meaningless embeddings — surface it via ``zero_embedding_count``.
+_zero_embedding_count = 0
+
+
+def zero_embedding_count() -> int:
+    """Number of CLIP extractions that failed and returned a zero vector."""
+    return _zero_embedding_count
+
+
+def reset_zero_embedding_count() -> None:
+    global _zero_embedding_count
+    _zero_embedding_count = 0
+
+
+def _record_zero_embedding(context: str, exc: BaseException) -> None:
+    global _zero_embedding_count
+    _zero_embedding_count += 1
+    # WARNING (not DEBUG) so an operator notices in the default log level.
+    # Includes ``context`` which the caller fills with the photo path when
+    # available, so post-run forensics can identify which files produced
+    # zero vectors without grepping through stage_extract output.
+    logger.warning("CLIP %s failed, returning zero vector: %s", context, exc)
 
 
 def _select_device():
@@ -52,10 +80,15 @@ def extract(
     model=None,
     preprocess=None,
     device=None,
+    context: str = "extract",
 ) -> np.ndarray:
     """
     Extract a normalised 512-dim CLIP embedding from a PIL Image.
     Returns a zero vector on failure.
+
+    ``context`` is included in the failure-log message — pass the photo
+    path so post-run forensics can identify which files produced zero
+    vectors. Defaults to ``"extract"`` to preserve backward compatibility.
     """
     import torch
 
@@ -68,7 +101,8 @@ def extract(
             emb = model.encode_image(tensor)
         emb = emb / emb.norm(dim=-1, keepdim=True)
         return emb.cpu().numpy()[0].astype(np.float32)
-    except Exception:
+    except (RuntimeError, ValueError, OSError, MemoryError) as exc:
+        _record_zero_embedding(context, exc)
         return np.zeros(512, dtype=np.float32)
 
 
@@ -98,7 +132,13 @@ def batch_extract(
                 embs = model.encode_image(tensors)
             embs = embs / embs.norm(dim=-1, keepdim=True)
             results.append(embs.cpu().numpy())
-        except Exception:
+        except (RuntimeError, ValueError, OSError, MemoryError) as exc:
+            global _zero_embedding_count
+            _zero_embedding_count += len(batch)
+            logger.warning(
+                "CLIP batch_extract failed for %d images, returning zero vectors: %s",
+                len(batch), exc,
+            )
             results.append(np.zeros((len(batch), 512), dtype=np.float32))
 
     return np.vstack(results).astype(np.float32)

@@ -13,11 +13,14 @@ the O(N²) CLIP scan with O(N·K) ANN queries via a VectorStore.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, List, Set
 
 import imagehash
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from src.vector_store import VectorStore
@@ -27,7 +30,13 @@ def compute_phash(img: Image.Image) -> str:
     """Return perceptual hash as a hex string."""
     try:
         return str(imagehash.phash(img))
-    except Exception:
+    except (OSError, ValueError, TypeError) as exc:
+        # imagehash can fail on unusual PIL image modes (1-bit BMP, 16-bit
+        # TIFF). Empty string makes hamming_distance return 64 (max), so the
+        # photo is never marked as a pHash duplicate. Logging keeps the
+        # otherwise-invisible failure observable.
+        logger.debug("compute_phash failed (mode=%s, size=%s): %s",
+                     img.mode, img.size, exc)
         return ""
 
 
@@ -167,7 +176,20 @@ def find_duplicates_ann(
         if not is_dup and accepted_paths:
             emb = rec.get("clip_emb")
             if emb is not None:
-                candidates = store.search_clip(emb, n_results=ann_k)
+                try:
+                    candidates = store.search_clip(emb, n_results=ann_k)
+                except (RuntimeError, ValueError, OSError) as exc:
+                    # ChromaDB query can raise on dimension mismatch or
+                    # transient HNSW issues. Skip ANN for this record only —
+                    # the pHash + exact-hash gates still run, so dedup
+                    # degrades gracefully instead of aborting the stage and
+                    # losing all dedup work for the rest of the library.
+                    logger.warning(
+                        "ANN search failed for %s (%s); falling back to "
+                        "pHash/exact-hash dedup for this record.",
+                        path, exc,
+                    )
+                    candidates = []
                 for cand_path, dist in candidates:
                     if cand_path not in accepted_paths:
                         continue
