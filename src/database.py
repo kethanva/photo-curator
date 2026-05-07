@@ -85,11 +85,20 @@ def init_db(db_path: str) -> None:
 def _add_column_if_missing(
     conn: sqlite3.Connection, table: str, column: str, definition: str
 ) -> None:
-    """ALTER TABLE … ADD COLUMN — silently skips if column already exists."""
+    """ALTER TABLE … ADD COLUMN — silently skips if column already exists.
+
+    Only suppresses the "duplicate column name" error. Other OperationalError
+    cases ("database is locked", "disk full", "attempt to write a readonly
+    database") are re-raised so a broken migration fails loudly instead of
+    silently leaving the schema half-applied.
+    """
     try:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-    except sqlite3.OperationalError:
-        pass  # Column already present
+    except sqlite3.OperationalError as exc:
+        msg = (exc.args[0] if exc.args else "").lower()
+        if "duplicate column name" in msg or "already exists" in msg:
+            return
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +124,52 @@ def get_by_path(conn: sqlite3.Connection, path: str) -> Optional[sqlite3.Row]:
 def get_all(
     conn: sqlite3.Connection, clause: str = "", params: tuple = ()
 ) -> list:
+    """Return photos, optionally filtered by ``clause``.
+
+    SECURITY: ``clause`` is interpolated directly into SQL — it MUST be a
+    static, code-controlled string (never user input, file content, or any
+    value derived from the photo library). Production code should prefer the
+    typed helpers below (``get_with_clip_emb``, ``get_non_private``,
+    ``get_kept``, ``get_with_face_count_at_least``); ``clause`` is retained
+    for ad-hoc/test use against this internal SQLite cache only.
+    """
     sql = "SELECT * FROM photos"
     if clause:
         sql += " WHERE " + clause
     return conn.execute(sql, params).fetchall()
+
+
+# Typed filter helpers — preferred over raw `clause` strings. Each helper
+# uses a fixed predicate; arguments flow through ``?`` placeholders only.
+
+def get_with_clip_emb(conn: sqlite3.Connection) -> list:
+    """Photos that have a CLIP embedding stored."""
+    return conn.execute(
+        "SELECT * FROM photos WHERE clip_emb IS NOT NULL"
+    ).fetchall()
+
+
+def get_non_private(conn: sqlite3.Connection) -> list:
+    """Photos not flagged private."""
+    return conn.execute(
+        "SELECT * FROM photos WHERE is_private=0"
+    ).fetchall()
+
+
+def get_kept(conn: sqlite3.Connection) -> list:
+    """Photos that survived privacy AND deduplication filters."""
+    return conn.execute(
+        "SELECT * FROM photos WHERE is_private=0 AND is_duplicate=0"
+    ).fetchall()
+
+
+def get_with_face_count_at_least(
+    conn: sqlite3.Connection, min_faces: int
+) -> list:
+    """Photos containing at least ``min_faces`` detected faces."""
+    return conn.execute(
+        "SELECT * FROM photos WHERE face_count >= ?", (int(min_faces),)
+    ).fetchall()
 
 
 def update_fields(conn: sqlite3.Connection, path: str, **kwargs) -> None:

@@ -75,9 +75,12 @@ class TestDmsToDecimal:
         result = _dms_to_decimal(dms, b"E")
         assert result == pytest.approx(0.0)
 
-    def test_bad_input_returns_zero(self):
+    def test_bad_input_returns_nan(self):
+        # NaN sentinel (not 0.0) so callers can distinguish a decode
+        # failure from a real 0° coordinate and refuse to set has_gps.
+        import math
         result = _dms_to_decimal([], b"N")
-        assert result == pytest.approx(0.0)
+        assert math.isnan(result)
 
     def test_known_coordinate(self):
         """37° 0' 0" N = 37.0 decimal degrees."""

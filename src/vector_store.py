@@ -24,6 +24,12 @@ _CLIP_DIM = 512
 _FACE_DIM = 512
 _UPSERT_CHUNK = 5_000   # recommended batch ceiling for ChromaDB upserts
 
+# Norm below which an embedding is treated as a zero / poison vector and
+# refused at the store boundary. The CLIP/FaceNet error paths return exact
+# zero vectors when extraction fails; admitting them silently corrupts cosine
+# NN results for every later query.
+_MIN_EMBEDDING_NORM = 1e-6
+
 
 class VectorStore:
     """
@@ -49,18 +55,25 @@ class VectorStore:
         import chromadb
 
         Path(store_path).mkdir(parents=True, exist_ok=True)
-        self._client = chromadb.PersistentClient(path=store_path)
-
-        # CLIP: cosine distance (CLIP embeddings are L2-normalised)
-        self._clip = self._client.get_or_create_collection(
-            name=clip_collection,
-            metadata={"hnsw:space": "cosine"},
-        )
-        # FaceNet: L2 distance (FaceNet embeddings are L2-normalised)
-        self._face = self._client.get_or_create_collection(
-            name=face_collection,
-            metadata={"hnsw:space": "l2"},
-        )
+        try:
+            self._client = chromadb.PersistentClient(path=store_path)
+            # CLIP: cosine distance (CLIP embeddings are L2-normalised)
+            self._clip = self._client.get_or_create_collection(
+                name=clip_collection,
+                metadata={"hnsw:space": "cosine"},
+            )
+            # FaceNet: L2 distance (FaceNet embeddings are L2-normalised)
+            self._face = self._client.get_or_create_collection(
+                name=face_collection,
+                metadata={"hnsw:space": "l2"},
+            )
+        except Exception as exc:
+            # ChromaDB raises a variety of internal exceptions on a corrupt
+            # HNSW index or locked database. Re-raise so the caller fails
+            # fast — silent fallback to in-memory or "empty store" mode would
+            # produce wrong dedup/clustering results without an obvious cause.
+            log.error("VectorStore init failed at %s: %s", store_path, exc)
+            raise
 
         log.info(
             "VectorStore ready — clip=%d  face=%d",
@@ -87,14 +100,31 @@ class VectorStore:
     # ------------------------------------------------------------------
 
     def upsert_clip(self, path: str, embedding: np.ndarray) -> None:
-        """Add or update a single CLIP embedding."""
+        """Add or update a single CLIP embedding.
+
+        Refuses zero / near-zero norm vectors: those are the sentinel returned
+        by ``embeddings.extract`` on extraction failure and would corrupt
+        cosine nearest-neighbour results for every subsequent query.
+        """
+        if embedding is None or float(np.linalg.norm(embedding)) < _MIN_EMBEDDING_NORM:
+            log.warning(
+                "Refusing zero-norm CLIP embedding for %s (extraction failed upstream)",
+                path,
+            )
+            return
         self._clip.upsert(
             ids=[path],
             embeddings=[embedding.astype(np.float32).tolist()],
         )
 
     def upsert_face(self, path: str, embedding: np.ndarray) -> None:
-        """Add or update a single face embedding."""
+        """Add or update a single face embedding. Same zero-norm guard as CLIP."""
+        if embedding is None or float(np.linalg.norm(embedding)) < _MIN_EMBEDDING_NORM:
+            log.warning(
+                "Refusing zero-norm face embedding for %s (FaceNet failed upstream)",
+                path,
+            )
+            return
         self._face.upsert(
             ids=[path],
             embeddings=[embedding.astype(np.float32).tolist()],
@@ -121,7 +151,25 @@ class VectorStore:
         self._upsert_batch(self._face, paths, embeddings)
 
     def _upsert_batch(self, col, paths: List[str], embeddings: np.ndarray) -> None:
-        emb_list = embeddings.astype(np.float32).tolist()
+        # Zero-norm vectors written to SQLite by older runs (before the
+        # single-item upsert added its norm guard) would otherwise be
+        # admitted here and poison cosine NN results for every later query.
+        # Filter them out at the boundary before chunked upsert.
+        emb_arr = embeddings.astype(np.float32)
+        if len(paths) > 0:
+            norms = np.linalg.norm(emb_arr, axis=1)
+            keep = norms >= _MIN_EMBEDDING_NORM
+            dropped = int((~keep).sum())
+            if dropped:
+                log.warning(
+                    "Refused %d zero-norm embedding(s) in batch upsert "
+                    "(stale entries from a prior run with a broken extractor).",
+                    dropped,
+                )
+                paths = [p for p, k in zip(paths, keep) if k]
+                emb_arr = emb_arr[keep]
+
+        emb_list = emb_arr.tolist()
         for start in range(0, len(paths), _UPSERT_CHUNK):
             end = start + _UPSERT_CHUNK
             col.upsert(
@@ -183,7 +231,7 @@ class VectorStore:
         matrix shape: (N, 512),  dtype float32.
         Returned in arbitrary order — use the paths list as an index.
         """
-        return self._get_all(self._clip)
+        return self._get_all(self._clip, _CLIP_DIM)
 
     def get_all_face(self) -> Tuple[List[str], np.ndarray]:
         """
@@ -191,11 +239,13 @@ class VectorStore:
 
         matrix shape: (N, 512),  dtype float32.
         """
-        return self._get_all(self._face)
+        return self._get_all(self._face, _FACE_DIM)
 
-    def _get_all(self, col) -> Tuple[List[str], np.ndarray]:
+    def _get_all(self, col, dim: int) -> Tuple[List[str], np.ndarray]:
+        # Empty-sentinel uses the per-collection dim so the shape stays
+        # correct if _CLIP_DIM and _FACE_DIM ever diverge.
         if col.count() == 0:
-            return [], np.zeros((0, _CLIP_DIM), dtype=np.float32)
+            return [], np.zeros((0, dim), dtype=np.float32)
         result = col.get(include=["embeddings"])
         paths = result["ids"]
         matrix = np.array(result["embeddings"], dtype=np.float32)

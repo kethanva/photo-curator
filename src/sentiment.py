@@ -16,14 +16,50 @@ Install:
 
 from __future__ import annotations
 
+import logging
 import os
+from typing import Optional
+
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 # Silence MediaPipe's C++ INFO/WARNING logs (GL context, feedback manager, etc.)
 # These are harmless runtime notes from the Metal GPU backend on Apple Silicon.
 os.environ.setdefault("GLOG_minloglevel", "2")       # suppress INFO + WARNING
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")   # suppress TF/XLA noise
+
+# Module-level singleton for MediaPipe FaceMesh. Initialising the graph costs
+# ~100ms; instantiating per image was wasting ~17 minutes on a 10k library.
+_face_mesh = None
+_face_mesh_load_failed = False
+
+
+def _get_face_mesh():
+    """Return the cached FaceMesh, building it on first call.
+
+    Returns ``None`` if MediaPipe is unavailable or graph init failed (and
+    sets ``_face_mesh_load_failed`` so we don't keep retrying).
+    """
+    global _face_mesh, _face_mesh_load_failed
+    if _face_mesh is not None or _face_mesh_load_failed:
+        return _face_mesh
+    try:
+        import mediapipe as mp
+        _face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=5,
+            refine_landmarks=False,
+            min_detection_confidence=0.5,
+        )
+    except ImportError:
+        _face_mesh_load_failed = True
+        logger.info("MediaPipe not installed — sentiment scoring disabled.")
+    except (RuntimeError, ValueError, OSError) as exc:
+        _face_mesh_load_failed = True
+        logger.warning("FaceMesh init failed (%s); sentiment scoring disabled.", exc)
+    return _face_mesh
 
 # ---------------------------------------------------------------------------
 # MediaPipe landmark indices (468-point Face Mesh)
@@ -80,19 +116,14 @@ def score_image(img: Image.Image) -> float:
         0.5 if no faces detected (neutral / unknown).
         0–1 based on eye openness and smile for the primary face.
     """
+    face_mesh = _get_face_mesh()
+    if face_mesh is None:
+        # MediaPipe absent or init failed — _get_face_mesh already logged.
+        return 0.5
+
     try:
-        import mediapipe as mp
-
         rgb = np.array(img.convert("RGB"))
-        face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=5,
-            refine_landmarks=False,
-            min_detection_confidence=0.5,
-        )
-
-        with face_mesh:
-            results = face_mesh.process(rgb)
+        results = face_mesh.process(rgb)
 
         if not results.multi_face_landmarks:
             return 0.5  # No face — neutral score
@@ -117,8 +148,8 @@ def score_image(img: Image.Image) -> float:
         # Use best face score (most expressive / primary subject)
         return float(max(face_scores))
 
-    except ImportError:
-        # MediaPipe not installed — return neutral score silently
-        return 0.5
-    except Exception:
+    except (RuntimeError, ValueError, OSError, IndexError) as exc:
+        # IndexError catches landmark-missing edge cases. Sentiment is an
+        # 18% ranking weight — silently returning 0.5 hides a dead stage.
+        logger.warning("sentiment.score_image failed: %s", exc)
         return 0.5

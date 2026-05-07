@@ -90,7 +90,7 @@ def _sync_store_from_sqlite(db_path: str, store: "vs.VectorStore") -> int:
     existing_face = store.face_ids()
 
     with database.connect(db_path) as conn:
-        rows = database.get_all(conn, "clip_emb IS NOT NULL")
+        rows = database.get_with_clip_emb(conn)
 
     clip_paths, clip_embs = [], []
     face_paths, face_embs = [], []
@@ -137,7 +137,15 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
     clip_model, clip_preprocess, clip_device = embeddings.load_model()
     print(f"  CLIP ready on {clip_device}")
 
+    embeddings.reset_zero_embedding_count()
+    face_detection.reset_detect_failure_count()
+    ingestion.reset_unreadable_count()
     processed = skipped = 0
+    # Commit cadence — protects partial progress against SIGINT / OOM kill.
+    # SQLite WAL journaling makes small commits cheap; 100 photos per commit
+    # has negligible overhead on a 10 GB library and bounds lost work to ~1
+    # batch on crash.
+    COMMIT_EVERY = 100
 
     with database.connect(db_path) as conn:
         for path in tqdm(paths, desc="  Extracting", unit="img", dynamic_ncols=True):
@@ -145,7 +153,9 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
             file_hash = ingestion.compute_file_hash(path)
 
             cached = database.get_by_path(conn, path_str)
-            if cached and cached["file_hash"] == file_hash:
+            if cached and ingestion.hash_matches_cached(
+                path, cached["file_hash"], file_hash
+            ):
                 skipped += 1
                 continue
 
@@ -158,7 +168,10 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                              "min_blur_score", "min_exposure_score",
                              "max_exposure_score", "min_resolution")},
                              orig_resolution=orig_shorter)
-            clip_emb   = embeddings.extract(img, clip_model, clip_preprocess, clip_device)
+            clip_emb   = embeddings.extract(
+                img, clip_model, clip_preprocess, clip_device,
+                context=f"extract path={path_str}",
+            )
             phash_str  = deduplication.compute_phash(img)
             face_count, face_emb, face_prominence, face_confidence = face_detection.detect(img)
             is_priv    = privacy.assess(
@@ -209,10 +222,34 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                 store.upsert_face(path_str, face_emb)
 
             processed += 1
+            if processed % COMMIT_EVERY == 0:
+                conn.commit()
 
         conn.commit()
 
+    failed_embeddings = embeddings.zero_embedding_count()
+    failed_faces = face_detection.detect_failure_count()
+    unreadable = ingestion.unreadable_count()
     print(f"  Processed {processed} new | Skipped {skipped} cached")
+    if unreadable:
+        print(
+            f"  WARNING: {unreadable} input file(s) could not be opened "
+            "(corrupt, truncated, or unsupported format). They were skipped "
+            "with no DB record so reruns will retry them — fix or remove the "
+            "files in input_photos to stop the warning."
+        )
+    if failed_embeddings:
+        print(
+            f"  WARNING: {failed_embeddings} photo(s) produced a zero CLIP "
+            "embedding (extraction failure). Downstream dedup/clustering "
+            "results for those photos will be unreliable."
+        )
+    if failed_faces:
+        print(
+            f"  WARNING: {failed_faces} photo(s) failed MTCNN/FaceNet and were "
+            "recorded with face_count=0. People-bucket selection and identity "
+            "clustering will miss those photos."
+        )
 
 
 def stage_aesthetic(cfg: dict, db_path: str) -> None:
@@ -220,7 +257,7 @@ def stage_aesthetic(cfg: dict, db_path: str) -> None:
     use_laion = cfg.get("aesthetic", {}).get("use_laion_predictor", False)
 
     with database.connect(db_path) as conn:
-        rows = database.get_all(conn, "clip_emb IS NOT NULL")
+        rows = database.get_with_clip_emb(conn)
         updates = 0
         for row in rows:
             emb = database.blob_to_emb(row["clip_emb"])
@@ -237,7 +274,7 @@ def stage_scene(cfg: dict, db_path: str) -> None:
     top_n = cfg.get("scene_tagging", {}).get("top_n", 3)
 
     with database.connect(db_path) as conn:
-        rows = database.get_all(conn, "clip_emb IS NOT NULL")
+        rows = database.get_with_clip_emb(conn)
         updates = 0
         for row in rows:
             emb = database.blob_to_emb(row["clip_emb"])
@@ -260,7 +297,7 @@ def stage_sentiment(cfg: dict, db_path: str, paths) -> None:
     min_faces = cfg.get("sentiment", {}).get("min_face_for_sentiment", 1)
 
     with database.connect(db_path) as conn:
-        rows = database.get_all(conn, "face_count >= ?", (min_faces,))
+        rows = database.get_with_face_count_at_least(conn, min_faces)
         path_to_row = {row["path"]: row for row in rows}
         updates = 0
 
@@ -339,7 +376,7 @@ def stage_dedup(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
     # Include quality_pass=0 photos so near-dup detection runs across the
     # full pool (the selector now admits top-scored quality-fail photos).
     with database.connect(db_path) as conn:
-        rows = database.get_all(conn, "is_private=0")
+        rows = database.get_non_private(conn)
         records = [
             {
                 "path":       r["path"],
@@ -484,7 +521,7 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: 
     # as a soft preference inside select_photos so the strict pool can be
     # topped up from top-scored quality-fail photos when it's too small.
     with database.connect(db_path) as conn:
-        rows    = database.get_all(conn, "is_private=0 AND is_duplicate=0")
+        rows    = database.get_kept(conn)
         records = [dict(r) for r in rows]
 
     # ── Score ─────────────────────────────────────────────────────
@@ -633,84 +670,109 @@ def run(
 
     t0 = time.time()
 
+    # current_stage is set before each stage call so the finally block can
+    # report which stage was running on an unhandled exception. Using a
+    # closure-captured list (instead of nonlocal) keeps the helper simple.
+    current_stage = ["init"]
+    paths: list = []
+    n_dups = 0
+    n_events = 0
+    selected: list = []
+    pipeline_failed = False
+    pipeline_empty = False  # True if stage 1 found zero photos
+
     def _stage(n: int, label: str):
         if n < from_stage:
             print(f"[{n}/9] {label} — skipped (resuming from stage {from_stage})")
             return False
         print(f"[{n}/9] {label}…")
+        current_stage[0] = f"{n}/9 {label}"
         return True
 
-    # ── Stage 1: Scan ─────────────────────────────────────────────
-    if _stage(1, "Scanning photos"):
-        extensions = set(cfg["ingestion"]["supported_extensions"])
-        paths = ingestion.scan_photos(input_dir, extensions)
-        print(f"  Found {len(paths)} images")
-        if not paths:
-            print("  Nothing to process.")
-            return
-    else:
-        from src import ingestion as _ing
-        paths = _ing.scan_photos(input_dir, set(cfg["ingestion"]["supported_extensions"]))
+    try:
+        # ── Stage 1: Scan ─────────────────────────────────────────────
+        if _stage(1, "Scanning photos"):
+            extensions = set(cfg["ingestion"]["supported_extensions"])
+            paths = ingestion.scan_photos(input_dir, extensions)
+            print(f"  Found {len(paths)} images")
+            if not paths:
+                print("  Nothing to process.")
+                pipeline_empty = True
+                return
+        else:
+            from src import ingestion as _ing
+            paths = _ing.scan_photos(input_dir, set(cfg["ingestion"]["supported_extensions"]))
 
-    # ── Stage 2: Feature extraction ───────────────────────────────
-    if _stage(2, "Extracting features"):
-        stage_extract(cfg, paths, db_path, store)
+        # ── Stage 2: Feature extraction ───────────────────────────────
+        if _stage(2, "Extracting features"):
+            stage_extract(cfg, paths, db_path, store)
 
-    # ── Stage 3: Aesthetic scoring ────────────────────────────────
-    if _stage(3, "Aesthetic scoring"):
-        stage_aesthetic(cfg, db_path)
+        # ── Stage 3: Aesthetic scoring ────────────────────────────────
+        if _stage(3, "Aesthetic scoring"):
+            stage_aesthetic(cfg, db_path)
 
-    # ── Stage 4: Scene tagging ────────────────────────────────────
-    if _stage(4, "Scene tagging"):
-        stage_scene(cfg, db_path)
+        # ── Stage 4: Scene tagging ────────────────────────────────────
+        if _stage(4, "Scene tagging"):
+            stage_scene(cfg, db_path)
 
-    # ── Stage 5: Sentiment ────────────────────────────────────────
-    if _stage(5, "Smile & eye detection"):
-        stage_sentiment(cfg, db_path, paths)
+        # ── Stage 5: Sentiment ────────────────────────────────────────
+        if _stage(5, "Smile & eye detection"):
+            stage_sentiment(cfg, db_path, paths)
 
-    # ── Privacy re-assessment (always runs — no image I/O, uses cached embeddings)
-    print("[*/9] Re-assessing privacy rules on cached photos…")
-    stage_reassess_privacy(cfg, db_path)
+        # ── Privacy re-assessment (always runs — no image I/O, uses cached embeddings)
+        current_stage[0] = "*/9 privacy re-assessment"
+        print("[*/9] Re-assessing privacy rules on cached photos…")
+        stage_reassess_privacy(cfg, db_path)
 
-    # ── Filename timestamp recovery (cheap — no image I/O, only filename parsing)
-    # Must run before clustering and selection so day/hour caps and event
-    # grouping work for cached photos that lacked EXIF timestamps at ingest
-    # (WhatsApp, screenshots, manual exports). Newly ingested photos already
-    # get this fallback inline via metadata.extract_exif.
-    print("[*/9] Recovering filename timestamps for cached photos…")
-    stage_backfill_filename_timestamps(db_path)
+        # ── Filename timestamp recovery (cheap — no image I/O, only filename parsing)
+        # Must run before clustering and selection so day/hour caps and event
+        # grouping work for cached photos that lacked EXIF timestamps at ingest
+        # (WhatsApp, screenshots, manual exports). Newly ingested photos already
+        # get this fallback inline via metadata.extract_exif.
+        current_stage[0] = "*/9 filename-timestamp recovery"
+        print("[*/9] Recovering filename timestamps for cached photos…")
+        stage_backfill_filename_timestamps(db_path)
 
-    # ── Stage 6: Deduplication ────────────────────────────────────
-    if _stage(6, "Deduplication"):
-        n_dups = stage_dedup(cfg, db_path, store)
-    else:
-        n_dups = 0
+        # ── Stage 6: Deduplication ────────────────────────────────────
+        if _stage(6, "Deduplication"):
+            n_dups = stage_dedup(cfg, db_path, store)
 
-    # ── Stage 7: Event clustering ─────────────────────────────────
-    if _stage(7, "Event clustering"):
-        n_events = stage_cluster(cfg, db_path, store)
-    else:
-        n_events = 0
+        # ── Stage 7: Event clustering ─────────────────────────────────
+        if _stage(7, "Event clustering"):
+            n_events = stage_cluster(cfg, db_path, store)
 
-    # ── Stage 8: Face identity clustering ────────────────────────
-    if _stage(8, "Face identity clustering"):
-        stage_face_clustering(cfg, db_path, store)
+        # ── Stage 8: Face identity clustering ────────────────────────
+        if _stage(8, "Face identity clustering"):
+            stage_face_clustering(cfg, db_path, store)
 
-    # ── Stage 9: Rank + select + output ──────────────────────────
-    if _stage(9, "Ranking & selecting"):
-        scores, selected = stage_rank_and_select(cfg, db_path, dry_run, total_photos=len(paths))
-    else:
-        selected = []
-
-    elapsed = time.time() - t0
-    print(f"\n{bar}")
-    print("  Done!")
-    print(f"  Total scanned:    {len(paths)}")
-    print(f"  Duplicates found: {n_dups}")
-    print(f"  Event clusters:   {n_events}")
-    print(f"  Selected:         {len(selected)}")
-    print(f"  Elapsed:          {elapsed:.0f}s  ({elapsed/60:.1f} min)")
-    print(f"{bar}\n")
+        # ── Stage 9: Rank + select + output ──────────────────────────
+        if _stage(9, "Ranking & selecting"):
+            scores, selected = stage_rank_and_select(
+                cfg, db_path, dry_run, total_photos=len(paths)
+            )
+    except Exception as exc:
+        # Surface which stage broke so the operator knows where to resume
+        # from (--from-stage N) and what was committed to the cache. The
+        # exception still re-raises so the traceback and exit code stay
+        # accurate; the finally block prints the partial summary first.
+        pipeline_failed = True
+        print(f"\n{bar}")
+        print(f"  Pipeline aborted at stage [{current_stage[0]}]: {exc}")
+        print(f"  Cache at {db_path} retains progress through completed stages.")
+        print(f"  Resume after fixing with: --from-stage <N>  (where N is the failed stage number).")
+        print(f"{bar}\n")
+        raise
+    finally:
+        elapsed = time.time() - t0
+        if not pipeline_failed and not pipeline_empty:
+            print(f"\n{bar}")
+            print("  Done!")
+            print(f"  Total scanned:    {len(paths)}")
+            print(f"  Duplicates found: {n_dups}")
+            print(f"  Event clusters:   {n_events}")
+            print(f"  Selected:         {len(selected)}")
+            print(f"  Elapsed:          {elapsed:.0f}s  ({elapsed/60:.1f} min)")
+            print(f"{bar}\n")
 
 
 def main():

@@ -96,11 +96,11 @@ class TestComputeFileHash:
         result = compute_file_hash(f)
         int(result, 16)  # should not raise
 
-    def test_correct_md5(self, tmp_path: Path):
+    def test_correct_sha256(self, tmp_path: Path):
         content = b"photo data here"
         f = tmp_path / "img.jpg"
         f.write_bytes(content)
-        expected = hashlib.md5(content).hexdigest()
+        expected = hashlib.sha256(content).hexdigest()
         assert compute_file_hash(f) == expected
 
     def test_identical_files_same_hash(self, tmp_path: Path):
@@ -121,7 +121,7 @@ class TestComputeFileHash:
     def test_empty_file(self, tmp_path: Path):
         f = tmp_path / "empty.jpg"
         f.write_bytes(b"")
-        expected = hashlib.md5(b"").hexdigest()
+        expected = hashlib.sha256(b"").hexdigest()
         assert compute_file_hash(f) == expected
 
 
