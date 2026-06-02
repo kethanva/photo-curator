@@ -7,6 +7,9 @@ build/
 .venv/
 venv/
 env/
+scratch*
+graphify-out/
+
 
 # Data — never commit photos or the generated DB
 data/input_photos/
