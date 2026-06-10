@@ -29,13 +29,39 @@ quality:
 deduplication:
   phash_threshold: 10        # Hamming distance — slightly looser to catch more burst-shot pairs
   embedding_similarity: 0.92 # cosine similarity floor — was 0.95; lower catches semantic near-dupes
+  # Perceptual-hash algorithm: phash (DCT, default) | dhash (gradient) |
+  # ahash (average) | whash (wavelet, needs PyWavelets). Applied at ingest.
+  hash_algorithm: phash
+  # Dual-hash confirmation gate — require a SECOND independent hash algorithm to
+  # also agree before grouping a pHash near-duplicate. Cuts false positives at
+  # the cost of one extra stored hash per photo. Changing these needs a re-ingest
+  # (or at least re-running stage_extract) so phash2 is populated.
+  dual_hash:
+    enabled: false
+    secondary: dhash         # second algorithm (must differ from hash_algorithm)
+    secondary_threshold: 8   # max Hamming distance for the secondary confirmation
+  # Burst-shot dedup — group photos shot within gap_seconds (EXIF timestamp)
+  # and keep only the sharpest. Independent of the pHash/CLIP pass.
+  burst:
+    enabled: true
+    gap_seconds: 3.0
 
 privacy:
   filter_screenshots: true
   filter_documents: true      # CLIP zero-shot doc / ID / meme / text-overlay detection
   filter_text_heavy: true     # binary CLIP check for chat screenshots / text-only images saved with camera filenames
   filter_boring_objects: true # filter out mundane photos like tubelights, doors, windows, walls
+  mundane_object_threshold: 0.62 # binary CLIP threshold for mundane-object detector (lower = stricter)
   filter_intimate_content: true # filter out intimate or highly private photos of people
+  # Accidental close-up gate: flesh-tone pixels fill the frame AND the photo is
+  # blurry → camera fired against a hand/skin. Pure-image, no model.
+  filter_accidental_closeup: true
+  min_flesh_fraction: 0.65       # min flesh-tone pixel fraction to consider (0–1)
+  max_accidental_blur_score: 120.0 # Laplacian variance at/below which a flesh-heavy frame is junk
+  # Pitch-black / pure-white frames (lens cap, pocket misfire, blown flash):
+  # extreme mean brightness AND near-zero tonal detail. Hard exclusion —
+  # plain exposure failures stay salvageable in selection, these do not.
+  filter_pitch_black: true
   filter_home_private: false  # enable to filter solo shots at home
   home_coords: null           # [lat, lon] or null
   home_radius_km: 0.5

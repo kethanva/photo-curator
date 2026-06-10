@@ -445,6 +445,8 @@ class TestReassessFromCache:
     def _insert(
         self, conn, path, *, is_private, clip_emb=None,
         camera_model="", has_gps=0, face_count=0,
+        blur_score=0.0, exposure_score=0.5,
+        detail_stddev=-1.0, flesh_fraction=-1.0,
     ):
         from src import database
 
@@ -453,9 +455,12 @@ class TestReassessFromCache:
         )
         conn.execute(
             "INSERT INTO photos (path, file_hash, is_private, clip_emb, "
-            "camera_model, has_gps, face_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "camera_model, has_gps, face_count, blur_score, exposure_score, "
+            "detail_stddev, flesh_fraction) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (path, "h_" + path, is_private, emb_blob,
-             camera_model, has_gps, face_count),
+             camera_model, has_gps, face_count, blur_score, exposure_score,
+             detail_stddev, flesh_fraction),
         )
 
     def _reassess(self, conn):
@@ -467,6 +472,7 @@ class TestReassessFromCache:
         with patch("src.privacy.is_document_from_embedding", return_value=False), \
              patch("src.privacy.is_text_heavy_from_embedding", return_value=False), \
              patch("src.privacy.is_boring_from_embedding", return_value=False), \
+             patch("src.privacy.is_mundane_object_from_embedding", return_value=False), \
              patch("src.privacy.is_intimate_from_embedding", return_value=False):
             return reassess_is_private_from_cache(conn)
 
@@ -547,6 +553,64 @@ class TestReassessFromCache:
             row = conn.execute(
                 "SELECT is_private FROM photos WHERE path=?",
                 ("/p/clean.jpg",),
+            ).fetchone()
+        assert row["is_private"] == 0
+
+    def test_preserves_accidental_closeup_flag(self, tmp_path):
+        """An accidental close-up shot HAS a camera model, but the gate must
+        refire from cached flesh/blur metrics instead of being revoked."""
+        from src import database
+
+        db_path = self._make_db(tmp_path)
+        with database.connect(db_path) as conn:
+            self._insert(conn, "/p/closeup.jpg", is_private=1,
+                         camera_model="iPhone 15", has_gps=1, face_count=0,
+                         blur_score=30.0, flesh_fraction=0.80,
+                         detail_stddev=20.0)
+            conn.commit()
+            self._reassess(conn)
+            row = conn.execute(
+                "SELECT is_private FROM photos WHERE path=?",
+                ("/p/closeup.jpg",),
+            ).fetchone()
+        assert row["is_private"] == 1
+
+    def test_preserves_pitch_black_flag(self, tmp_path):
+        """A lens-cap shot HAS a camera model; the pitch-black gate must
+        refire from cached exposure/detail metrics."""
+        from src import database
+
+        db_path = self._make_db(tmp_path)
+        with database.connect(db_path) as conn:
+            self._insert(conn, "/p/lenscap.jpg", is_private=1,
+                         camera_model="Pixel 7", has_gps=1, face_count=0,
+                         exposure_score=0.01, detail_stddev=0.4,
+                         flesh_fraction=0.0, blur_score=5.0)
+            conn.commit()
+            self._reassess(conn)
+            row = conn.execute(
+                "SELECT is_private FROM photos WHERE path=?",
+                ("/p/lenscap.jpg",),
+            ).fetchone()
+        assert row["is_private"] == 1
+
+    def test_sentinel_metrics_skip_replay_and_revoke(self, tmp_path):
+        """A pre-migration row (-1 sentinels) with real-photo signals follows
+        the existing revocation path — the metric gates must not fire on
+        sentinel values."""
+        from src import database
+
+        db_path = self._make_db(tmp_path)
+        with database.connect(db_path) as conn:
+            self._insert(conn, "/p/legacy.jpg", is_private=1,
+                         camera_model="iPhone 15", has_gps=1, face_count=1,
+                         blur_score=30.0, exposure_score=0.01,
+                         detail_stddev=-1.0, flesh_fraction=-1.0)
+            conn.commit()
+            self._reassess(conn)
+            row = conn.execute(
+                "SELECT is_private FROM photos WHERE path=?",
+                ("/p/legacy.jpg",),
             ).fetchone()
         assert row["is_private"] == 0
 
@@ -757,3 +821,150 @@ class TestAssessStructuralBackstop:
             )
         assert result is False
         struct.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# is_accidental_closeup tests
+# ---------------------------------------------------------------------------
+
+from src.privacy import is_accidental_closeup
+
+
+class TestIsAccidentalCloseup:
+    def test_flesh_heavy_and_blurry_is_closeup(self):
+        assert is_accidental_closeup(flesh_fraction=0.80, blur_score=40.0) is True
+
+    def test_flesh_heavy_but_sharp_is_not_closeup(self):
+        # Sharp portrait close-up: high flesh but well-focused → keep.
+        assert is_accidental_closeup(flesh_fraction=0.80, blur_score=500.0) is False
+
+    def test_low_flesh_is_not_closeup(self):
+        assert is_accidental_closeup(flesh_fraction=0.20, blur_score=10.0) is False
+
+    def test_threshold_boundaries_inclusive(self):
+        assert is_accidental_closeup(0.65, 120.0, 0.65, 120.0) is True
+        assert is_accidental_closeup(0.6499, 120.0, 0.65, 120.0) is False
+        assert is_accidental_closeup(0.65, 120.01, 0.65, 120.0) is False
+
+
+class TestAssessAccidentalCloseup:
+    def test_assess_flags_accidental_closeup(self):
+        img = _img((1000, 1000))  # dims not a screen res
+        flagged = assess(
+            img=img, camera_model="Pixel 7", has_gps=True,
+            lat=12.0, lon=77.0, face_count=0, home=None, home_radius_km=0.5,
+            filter_screenshots=False, filter_documents=False,
+            filter_text_heavy=False, filter_boring_objects=False,
+            filter_intimate_content=False,
+            filter_accidental_closeup=True,
+            flesh_fraction=0.80, blur_score=30.0,
+        )
+        assert flagged is True
+
+    def test_assess_keeps_sharp_portrait(self):
+        img = _img((1000, 1000))
+        flagged = assess(
+            img=img, camera_model="Pixel 7", has_gps=True,
+            lat=12.0, lon=77.0, face_count=1, home=None, home_radius_km=0.5,
+            filter_screenshots=False, filter_documents=False,
+            filter_text_heavy=False, filter_boring_objects=False,
+            filter_intimate_content=False,
+            filter_accidental_closeup=True,
+            flesh_fraction=0.80, blur_score=600.0,
+        )
+        assert flagged is False
+
+    def test_assess_gate_disabled(self):
+        img = _img((1000, 1000))
+        flagged = assess(
+            img=img, camera_model="Pixel 7", has_gps=True,
+            lat=12.0, lon=77.0, face_count=0, home=None, home_radius_km=0.5,
+            filter_screenshots=False, filter_documents=False,
+            filter_text_heavy=False, filter_boring_objects=False,
+            filter_intimate_content=False,
+            filter_accidental_closeup=False,
+            flesh_fraction=0.99, blur_score=1.0,
+        )
+        assert flagged is False
+
+    def test_assess_default_blur_inf_never_trips(self):
+        # Caller omits blur_score → default +inf → gate can't fire even on flesh.
+        img = _img((1000, 1000))
+        flagged = assess(
+            img=img, camera_model="Pixel 7", has_gps=True,
+            lat=12.0, lon=77.0, face_count=0, home=None, home_radius_km=0.5,
+            filter_screenshots=False, filter_documents=False,
+            filter_text_heavy=False, filter_boring_objects=False,
+            filter_intimate_content=False,
+            filter_accidental_closeup=True,
+            flesh_fraction=0.99,
+        )
+        assert flagged is False
+
+
+# ---------------------------------------------------------------------------
+# is_pitch_black_or_pure_white tests
+# ---------------------------------------------------------------------------
+
+from src.privacy import is_pitch_black_or_pure_white
+
+
+class TestIsPitchBlackOrPureWhite:
+    def test_pitch_black_frame_flagged(self):
+        assert is_pitch_black_or_pure_white(exposure_score=0.01, detail_stddev=0.5) is True
+
+    def test_pure_white_frame_flagged(self):
+        assert is_pitch_black_or_pure_white(exposure_score=0.99, detail_stddev=0.5) is True
+
+    def test_dark_but_textured_night_scene_kept(self):
+        # City lights at night: dark mean but real tonal detail.
+        assert is_pitch_black_or_pure_white(exposure_score=0.04, detail_stddev=25.0) is False
+
+    def test_bright_snow_field_kept(self):
+        assert is_pitch_black_or_pure_white(exposure_score=0.96, detail_stddev=18.0) is False
+
+    def test_normal_exposure_flat_frame_kept(self):
+        # Flat but mid-gray (e.g. fog) — not pitch black / pure white.
+        assert is_pitch_black_or_pure_white(exposure_score=0.50, detail_stddev=1.0) is False
+
+    def test_threshold_boundaries(self):
+        # detail must be strictly < 2.0; exposure strictly outside [0.05, 0.95].
+        assert is_pitch_black_or_pure_white(0.05, 1.0) is False
+        assert is_pitch_black_or_pure_white(0.95, 1.0) is False
+        assert is_pitch_black_or_pure_white(0.04, 2.0) is False
+
+
+class TestAssessPitchBlack:
+    def _assess(self, **kw):
+        img = _img((1000, 1000))
+        defaults = dict(
+            img=img, camera_model="Pixel 7", has_gps=True,
+            lat=12.0, lon=77.0, face_count=0, home=None, home_radius_km=0.5,
+            filter_screenshots=False, filter_documents=False,
+            filter_text_heavy=False, filter_boring_objects=False,
+            filter_intimate_content=False, filter_accidental_closeup=False,
+        )
+        defaults.update(kw)
+        return assess(**defaults)
+
+    def test_assess_flags_pitch_black(self):
+        assert self._assess(
+            filter_pitch_black=True, exposure_score=0.01, detail_stddev=0.3,
+        ) is True
+
+    def test_assess_flags_pure_white(self):
+        assert self._assess(
+            filter_pitch_black=True, exposure_score=0.99, detail_stddev=0.3,
+        ) is True
+
+    def test_assess_gate_disabled(self):
+        assert self._assess(
+            filter_pitch_black=False, exposure_score=0.01, detail_stddev=0.3,
+        ) is False
+
+    def test_assess_default_exposure_never_trips(self):
+        # Caller omits exposure_score → neutral 0.5 default → gate can't fire
+        # even when detail_stddev is low.
+        assert self._assess(
+            filter_pitch_black=True, detail_stddev=0.0,
+        ) is False

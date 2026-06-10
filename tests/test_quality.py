@@ -200,3 +200,77 @@ class TestAssess:
         img = _checkerboard((800, 800))
         result = assess(img, orig_resolution=0)
         assert result.resolution == 800
+
+
+# ---------------------------------------------------------------------------
+# flesh_fraction tests (accidental close-up signal)
+# ---------------------------------------------------------------------------
+
+from src.quality import flesh_fraction
+
+
+class TestFleshFraction:
+    def test_skin_tone_image_high_fraction(self):
+        """A frame filled with a flesh tone (hue ~25°) scores near 1.0."""
+        # RGB (224, 150, 120): hue ≈ 17°, sat ≈ 0.46, val ≈ 0.88 → in band.
+        img = _solid_rgb(224, 150, 120, size=(80, 80))
+        assert flesh_fraction(img) > 0.9
+
+    def test_gray_image_zero_fraction(self):
+        """Neutral gray has zero saturation → never flesh."""
+        img = _solid_rgb(128, 128, 128, size=(80, 80))
+        assert flesh_fraction(img) == 0.0
+
+    def test_blue_image_zero_fraction(self):
+        """Pure blue (hue 240°) is far outside the flesh band."""
+        img = _solid_rgb(20, 40, 220, size=(80, 80))
+        assert flesh_fraction(img) == 0.0
+
+    def test_half_skin_half_gray(self):
+        """Half flesh, half gray → roughly 0.5 fraction."""
+        arr = np.zeros((80, 80, 3), dtype=np.uint8)
+        arr[:, :40] = [224, 150, 120]   # flesh
+        arr[:, 40:] = [128, 128, 128]   # gray
+        img = Image.fromarray(arr, "RGB")
+        f = flesh_fraction(img)
+        assert 0.4 <= f <= 0.6
+
+    def test_assess_populates_flesh_fraction(self):
+        img = _solid_rgb(224, 150, 120, size=(80, 80))
+        result = assess(img)
+        assert result.flesh_fraction > 0.9
+
+
+# ---------------------------------------------------------------------------
+# mundane_heuristic_score flesh-discount tests
+# ---------------------------------------------------------------------------
+
+from src.quality import mundane_heuristic_score
+
+
+class TestMundaneFleshDiscount:
+    def test_flesh_heavy_frame_not_mundane(self):
+        """A skin-toned frame (person in shot) must score ~0 despite being
+        uniform — the flesh discount overrides the uniformity signals."""
+        img = _solid_rgb(224, 150, 120, size=(80, 80))
+        assert mundane_heuristic_score(img) < 0.1
+
+    def test_gray_wall_still_mundane(self):
+        """A flat gray wall has no flesh → full mundane score retained."""
+        img = _solid_rgb(128, 128, 128, size=(80, 80))
+        assert mundane_heuristic_score(img) >= 0.62
+
+    def test_explicit_flesh_param_overrides_recompute(self):
+        """Passing flesh explicitly skips internal recomputation and applies
+        the discount based on the supplied value."""
+        img = _solid_rgb(128, 128, 128, size=(80, 80))
+        undiscounted = mundane_heuristic_score(img, flesh=0.0)
+        discounted = mundane_heuristic_score(img, flesh=0.30)
+        assert discounted < undiscounted
+        assert discounted == pytest.approx(max(undiscounted - 0.30 * 3.0, 0.0))
+
+    def test_assess_uses_flesh_discounted_mundane(self):
+        """quality.assess must feed its flesh fraction into the mundane score:
+        a flesh-filled frame reports a near-zero mundane_score."""
+        result = assess(_solid_rgb(224, 150, 120, size=(80, 80)))
+        assert result.mundane_score < 0.1
