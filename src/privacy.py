@@ -22,6 +22,12 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+# detail_stddev (luma stddev) below this = a flat, featureless frame with no
+# tonal variation (blank wall, ceiling). Used to gate the pure-image mundane
+# heuristic so it only hard-excludes genuinely subject-less frames when CLIP
+# is unavailable to corroborate.
+_FLAT_FRAME_DETAIL_MAX = 12.0
+
 
 # ---------------------------------------------------------------------------
 # Heuristic: screenshot detection
@@ -55,6 +61,59 @@ def is_screenshot(
 
     w, h = img.size
     return (w, h) in _SCREEN_RESOLUTIONS or (h, w) in _SCREEN_RESOLUTIONS
+
+
+# ---------------------------------------------------------------------------
+# Heuristic: accidental close-up (camera fired against hand/skin)
+# ---------------------------------------------------------------------------
+
+
+def is_accidental_closeup(
+    flesh_fraction: float,
+    blur_score: float,
+    min_flesh_fraction: float = 0.65,
+    max_blur_score: float = 120.0,
+) -> bool:
+    """
+    True when flesh-tone pixels dominate the frame AND the image is blurry —
+    the signature of a camera fired by accident against a hand/skin with no
+    intentional subject.
+
+    Both gates must trip: a sharp, well-composed portrait close-up also has a
+    high flesh fraction but is NOT blurry, so the blur ceiling protects it.
+
+    Ported from photos-cleanup/src/junk.rs AccidentalCloseup gate.
+    """
+    return flesh_fraction >= min_flesh_fraction and blur_score <= max_blur_score
+
+
+# ---------------------------------------------------------------------------
+# Heuristic: pitch-black / pure-white frame
+# ---------------------------------------------------------------------------
+
+
+def is_pitch_black_or_pure_white(
+    exposure_score: float,
+    detail_stddev: float,
+    max_detail_stddev: float = 2.0,
+    dark_exposure: float = 0.05,
+    bright_exposure: float = 0.95,
+) -> bool:
+    """
+    True for frames that are almost completely pure black or pure white —
+    lens-cap shots, pocket misfires in the dark, blown-out flashes against a
+    wall. Requires BOTH extreme mean brightness and near-zero tonal detail, so
+    a dark-but-textured night scene or a bright snow field still passes.
+
+    This matters as a hard exclusion because the selection stage treats
+    exposure failures as salvageable (fallback-pool admission); a true black
+    frame must never re-enter that way.
+
+    Ported from photos-cleanup/src/junk.rs PitchBlackOrPureWhite gate.
+    """
+    return detail_stddev < max_detail_stddev and (
+        exposure_score < dark_exposure or exposure_score > bright_exposure
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +272,7 @@ def is_text_heavy_from_embedding(
         return False
 
 # ---------------------------------------------------------------------------
-# Boring Objects Detection
+# Boring Objects Detection (legacy — kept for cache reassess compatibility)
 # ---------------------------------------------------------------------------
 
 _BORING_PROMPTS = [
@@ -284,6 +343,133 @@ def is_boring_from_embedding(
         return best_boring >= ratio * max(normal_prob, 1e-6)
     except (RuntimeError, ValueError, OSError, MemoryError) as exc:
         logger.warning("is_boring_from_embedding failed: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Mundane Object Detection — binary per-variant approach
+# ---------------------------------------------------------------------------
+# Catches photos where a random everyday object fills the frame with no
+# meaningful photographic intent: a door, a switch, a pipe, an appliance,
+# clutter on a counter, a wall, etc.  Uses the same per-variant binary
+# softmax as is_text_heavy_from_embedding so adding more prompts doesn't
+# dilute the signal.
+#
+# Intentionally does NOT fire on:
+#   • landscapes, mountains, nature, sky
+#   • people, faces, crowds
+#   • bikes, motorcycles, vehicles in context
+#   • architecture with interesting composition
+#   • food / dining scenes
+# Those are excluded by pairing each mundane prompt against a rich
+# "meaningful photo" baseline in a binary contest.
+
+_MUNDANE_PROMPTS = (
+    # Structural surfaces
+    "a close-up photo of a blank or featureless wall",
+    "a close-up photo of a door or door handle",
+    "a photo of a window frame or glass pane",
+    "a photo of a floor or carpet with nothing else visible",
+    "a close-up of ceiling tiles or a bare ceiling",
+    # Fixtures and fittings
+    "a photo of a light switch or electrical socket on a wall",
+    "a photo of a ceiling fan, tubelight, or overhead light fixture",
+    "a photo of a pipe, cable, or wire attached to a wall",
+    "a photo of an air conditioner unit, vent, or grille",
+    "a photo of a drain, tap, or plumbing fixture",
+    # Appliances and furniture close-ups
+    "a photo of a washing machine, refrigerator, or household appliance",
+    "a close-up of furniture from an odd angle with no context",
+    "a photo of an empty shelf, cabinet, or cupboard",
+    "a photo of a mattress, bed frame, or pillow with no people",
+    # Clutter and junk
+    "a photo of a trash bin, garbage bag, or waste",
+    "a photo of random clutter or miscellaneous junk",
+    "a photo of construction material, bare concrete, or scaffolding",
+    "a photo of random objects on a counter or shelf with no context",
+    # Accidental / unintentional shots
+    "a blurry or accidental close-up of a random everyday object",
+    "an unintentional photo taken by mistake of a random surface",
+    # Vehicle detail without context
+    "a close-up photo of a car tire, wheel, or engine part with nothing else",
+    # Other mundane singletons
+    "a photo of a lock, padlock, or latch",
+    "a photo of a staircase or railing with no people",
+    "a photo of a parking lot or empty road with no interesting content",
+)
+
+# Baseline: what we want to KEEP — meaningful, display-worthy photos.
+_MEANINGFUL_PHOTO_PROMPT = (
+    "a meaningful photograph of people, nature, landscapes, mountains, "
+    "animals, celebrations, travel, sports, food, or memorable moments"
+)
+
+_mundane_features = None
+_mundane_loaded = False
+
+
+def _get_mundane_features():
+    """Encode mundane prompts + meaningful baseline once; rows[0..N-1] = mundane, row[N] = baseline."""
+    global _mundane_features, _mundane_loaded
+    import torch
+    import clip
+    from src.embeddings import load_model
+
+    model, preprocess, device = load_model()
+
+    if not _mundane_loaded:
+        prompts = list(_MUNDANE_PROMPTS) + [_MEANINGFUL_PHOTO_PROMPT]
+        tokens = clip.tokenize(prompts).to(device)
+        with torch.no_grad():
+            feats = model.encode_text(tokens)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        _mundane_features = feats
+        _mundane_loaded = True
+
+    return _mundane_features, model, preprocess, device
+
+
+def is_mundane_object_from_embedding(
+    clip_emb: Optional[np.ndarray],
+    threshold: float = 0.62,
+) -> bool:
+    """
+    CLIP check: True when the image is dominated by a random mundane object
+    that completely fills the frame with no display-worthy intent.
+
+    Uses binary per-variant softmax: for each mundane prompt we run a
+    2-class softmax (mundane_i vs meaningful_baseline) and return True if
+    ANY variant's mundane probability clears ``threshold``.  This avoids the
+    multi-class dilution of the legacy boring detector and scales cleanly
+    with many prompts.
+
+    threshold=0.62:  real people/landscape/event photos score 0.35–0.55 on
+    even the closest mundane prompt; genuine random-object photos score
+    0.65–0.90 on at least one matching variant.  0.62 sits in the gap.
+    """
+    if clip_emb is None:
+        return False
+    try:
+        import torch
+
+        all_feats, _, _, device = _get_mundane_features()
+        image_tensor = torch.tensor(clip_emb, device=device).unsqueeze(0)
+        image_tensor = image_tensor / image_tensor.norm(dim=-1, keepdim=True)
+
+        baseline = all_feats[-1:]   # meaningful photo
+        variants = all_feats[:-1]   # mundane prompts
+
+        max_mundane_prob = 0.0
+        for i in range(variants.shape[0]):
+            pair = torch.cat([variants[i : i + 1], baseline], dim=0)
+            logits = (image_tensor @ pair.T * 100.0).softmax(dim=-1)
+            prob = float(logits[0, 0].item())
+            if prob > max_mundane_prob:
+                max_mundane_prob = prob
+
+        return max_mundane_prob >= threshold
+    except (RuntimeError, ValueError, OSError, MemoryError) as exc:
+        logger.warning("is_mundane_object_from_embedding failed: %s", exc)
         return False
 
 
@@ -608,16 +794,26 @@ def reassess_is_private_from_cache(
     document_ratio: float = 3.0,
     filter_text_heavy: bool = True,
     filter_boring_objects: bool = True,
+    mundane_object_threshold: float = 0.62,
     filter_intimate_content: bool = True,
+    filter_accidental_closeup: bool = True,
+    min_flesh_fraction: float = 0.65,
+    max_accidental_blur_score: float = 120.0,
+    filter_pitch_black: bool = True,
 ) -> Tuple[int, int]:
     """
     Recompute is_private for every cached photo using only the stored CLIP
-    embedding and the filename; updates rows in place.
+    embedding, cached per-pixel metrics, and the filename; updates rows in
+    place.
 
-    Only the document/text-overlay CLIP check and the filename filter are
-    applied here — the screenshot and home-private checks rely on EXIF
-    already captured correctly at ingest time and don't change between
-    runs, so their cached flag contributions are preserved.
+    The CLIP checks, the filename filter, and the metric-replayable gates
+    (accidental close-up, pitch-black/pure-white — their raw inputs are
+    persisted at ingest) are applied here. The screenshot and home-private
+    checks rely on EXIF already captured correctly at ingest time and don't
+    change between runs, so their cached flag contributions are preserved.
+
+    Rows ingested before the metric columns existed carry the -1 sentinel;
+    their metric gates are skipped rather than replayed against bogus zeros.
 
     Returns:
         (total_rows_examined, rows_changed)
@@ -625,7 +821,8 @@ def reassess_is_private_from_cache(
     from src import database
 
     rows = conn.execute(
-        "SELECT path, clip_emb, is_private, camera_model, has_gps, face_count "
+        "SELECT path, clip_emb, is_private, camera_model, has_gps, face_count, "
+        "blur_score, exposure_score, detail_stddev, flesh_fraction "
         "FROM photos"
     ).fetchall()
 
@@ -643,12 +840,38 @@ def reassess_is_private_from_cache(
             filter_reshared and is_reshared_filename(path, reshared_prefixes)
         )
         text_hit = filter_text_heavy and is_text_heavy_from_embedding(clip_emb)
-        boring_hit = filter_boring_objects and is_boring_from_embedding(clip_emb)
+        boring_hit = filter_boring_objects and (
+            is_boring_from_embedding(clip_emb)
+            or is_mundane_object_from_embedding(clip_emb, threshold=mundane_object_threshold)
+        )
         intimate_hit = (
             filter_intimate_content and is_intimate_from_embedding(clip_emb)
         )
+
+        # Metric-replayable gates. Without these, the revocation branch below
+        # would un-flag accidental close-ups and lens-cap shots on every
+        # reassess run — those photos DO carry a camera model. -1 sentinel
+        # (pre-migration row) disables the gate for that row.
+        flesh = float(row["flesh_fraction"] if row["flesh_fraction"] is not None else -1.0)
+        detail = float(row["detail_stddev"] if row["detail_stddev"] is not None else -1.0)
+        blur = float(row["blur_score"] or 0.0)
+        exposure = float(row["exposure_score"] if row["exposure_score"] is not None else 0.5)
+        closeup_hit = (
+            filter_accidental_closeup
+            and flesh >= 0.0
+            and is_accidental_closeup(
+                flesh, blur, min_flesh_fraction, max_accidental_blur_score
+            )
+        )
+        pitch_hit = (
+            filter_pitch_black
+            and detail >= 0.0
+            and is_pitch_black_or_pure_white(exposure, detail)
+        )
+
         new_flag_from_cache = bool(
             doc_hit or reshared_hit or text_hit or boring_hit or intimate_hit
+            or closeup_hit or pitch_hit
         )
 
         # Reassessment only sees CLIP-recomputable + filename signals. Two other
@@ -735,12 +958,22 @@ def assess(
     filter_documents: bool = True,
     filter_text_heavy: bool = True,
     filter_boring_objects: bool = True,
+    mundane_object_threshold: float = 0.62,
     filter_intimate_content: bool = True,
     filter_home_private: bool = False,
     filter_reshared: bool = True,
     path: Optional[Union[str, Path]] = None,
     reshared_prefixes: Optional[Iterable[str]] = None,
     clip_emb: Optional[np.ndarray] = None,
+    mundane_heuristic: float = 0.0,
+    detail_stddev: float = 0.0,
+    filter_accidental_closeup: bool = True,
+    flesh_fraction: float = 0.0,
+    blur_score: float = float("inf"),
+    min_flesh_fraction: float = 0.65,
+    max_accidental_blur_score: float = 120.0,
+    filter_pitch_black: bool = True,
+    exposure_score: float = 0.5,
 ) -> bool:
     """
     Return True if the photo should be excluded from the curated output.
@@ -752,6 +985,21 @@ def assess(
     if filter_reshared and path is not None and is_reshared_filename(path, reshared_prefixes):
         return True
     if filter_screenshots and is_screenshot(img, camera_model, has_gps):
+        return True
+    # Accidental close-up (hand/skin against lens). Pure-image, no model — the
+    # flesh fraction and blur score are precomputed in quality.assess and passed
+    # in. blur_score defaults to +inf so a caller that omits it never trips this.
+    if filter_accidental_closeup and is_accidental_closeup(
+        flesh_fraction, blur_score, min_flesh_fraction, max_accidental_blur_score
+    ):
+        return True
+    # Pitch-black / pure-white frame (lens cap, pocket misfire, blown flash).
+    # Hard-excluded here because the selection stage can re-admit exposure
+    # failures via its fallback pool. exposure_score defaults to 0.5 (neutral)
+    # so a caller that omits it never trips this gate.
+    if filter_pitch_black and is_pitch_black_or_pure_white(
+        exposure_score, detail_stddev
+    ):
         return True
     if filter_home_private and is_home_private(lat, lon, face_count, home, home_radius_km):
         return True
@@ -772,9 +1020,30 @@ def assess(
         # the original image data — the cache reassess path can't replay it.
         if looks_like_text_document_page(img):
             return True
-    # Boring objects filter
-    if filter_boring_objects and clip_emb is not None:
-        if is_boring_from_embedding(clip_emb):
+    # Boring / mundane object filter.
+    if filter_boring_objects:
+        if clip_emb is not None:
+            # CLIP semantic detectors are the authority on "mundane object".
+            # The pure-image heuristic (mundane_heuristic_score) is NOT a
+            # standalone hard gate here: it scores snow fields, fog, clean
+            # sky, beach horizons, minimalist and backlit frames ~1.0 and
+            # would silently exclude legitimate photos. CLIP correctly reads
+            # those as nature/landscape and leaves them in, so when an
+            # embedding is available we defer to it entirely.
+            if is_boring_from_embedding(clip_emb):
+                return True
+            if is_mundane_object_from_embedding(clip_emb, threshold=mundane_object_threshold):
+                return True
+        elif (
+            mundane_heuristic >= 0.80
+            and detail_stddev < _FLAT_FRAME_DETAIL_MAX
+            and face_count == 0
+        ):
+            # No embedding to corroborate (CLIP extraction failed). Fall back
+            # to the structural heuristic, but only for a clearly flat,
+            # subject-less frame — high uniformity AND no tonal detail AND no
+            # detected face. Errs toward keeping ambiguous frames rather than
+            # dropping them.
             return True
     # Intimate content filter
     if filter_intimate_content and clip_emb is not None:

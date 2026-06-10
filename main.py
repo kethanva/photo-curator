@@ -95,19 +95,36 @@ def _sync_store_from_sqlite(db_path: str, store: "vs.VectorStore") -> int:
     clip_paths, clip_embs = [], []
     face_paths, face_embs = [], []
 
+    # ChromaDB collections are fixed-width (512-dim). A legacy / corrupt blob
+    # that decodes to any other length would make np.vstack raise and abort
+    # startup, so filter on exact dimension here — blob_to_emb only guards
+    # the multiple-of-4 byte length, not the embedding dimension.
+    _EMB_DIM = 512
+    skipped_dim = 0
+
     for row in rows:
         path = row["path"]
         if path not in existing_clip:
             emb = database.blob_to_emb(row["clip_emb"])
-            if emb is not None:
+            if emb is not None and emb.shape == (_EMB_DIM,):
                 clip_paths.append(path)
                 clip_embs.append(emb)
+            elif emb is not None:
+                skipped_dim += 1
 
         if row["face_emb"] and path not in existing_face:
             femb = database.blob_to_emb(row["face_emb"])
-            if femb is not None:
+            if femb is not None and femb.shape == (_EMB_DIM,):
                 face_paths.append(path)
                 face_embs.append(femb)
+            elif femb is not None:
+                skipped_dim += 1
+
+    if skipped_dim:
+        print(
+            f"  Skipped {skipped_dim} cached embedding(s) with an unexpected "
+            f"dimension (≠ {_EMB_DIM}) during vector-store sync."
+        )
 
     if clip_paths:
         store.upsert_clip_batch(clip_paths, np.vstack(clip_embs))
@@ -131,7 +148,15 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
     max_dim = cfg["ingestion"]["max_dimension"]
     q_cfg   = cfg["quality"]
     p_cfg   = cfg["privacy"]
+    d_cfg   = cfg["deduplication"]
     home    = _home_coords(cfg)
+
+    # Perceptual-hash algorithm + optional dual-hash secondary (computed once
+    # per photo at ingest; the dedup stage reuses both from the DB).
+    hash_algo      = d_cfg.get("hash_algorithm", deduplication.DEFAULT_HASH_ALGORITHM)
+    dual_cfg       = d_cfg.get("dual_hash") or {}
+    dual_enabled   = bool(dual_cfg.get("enabled", False))
+    secondary_algo = dual_cfg.get("secondary", "dhash")
 
     print("  Loading CLIP model…")
     clip_model, clip_preprocess, clip_device = embeddings.load_model()
@@ -172,7 +197,11 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                 img, clip_model, clip_preprocess, clip_device,
                 context=f"extract path={path_str}",
             )
-            phash_str  = deduplication.compute_phash(img)
+            phash_str  = deduplication.compute_phash(img, hash_algo)
+            phash2_str = (
+                deduplication.compute_phash(img, secondary_algo)
+                if dual_enabled else ""
+            )
             face_count, face_emb, face_prominence, face_confidence = face_detection.detect(img)
             is_priv    = privacy.assess(
                 img=img,
@@ -186,12 +215,29 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                 filter_documents=p_cfg["filter_documents"],
                 filter_text_heavy=p_cfg.get("filter_text_heavy", True),
                 filter_boring_objects=p_cfg.get("filter_boring_objects", True),
+                mundane_object_threshold=p_cfg.get("mundane_object_threshold", 0.62),
                 filter_intimate_content=p_cfg.get("filter_intimate_content", True),
                 filter_home_private=p_cfg["filter_home_private"],
                 filter_reshared=p_cfg.get("filter_reshared", True),
                 reshared_prefixes=p_cfg.get("reshared_prefixes"),
                 path=path,
                 clip_emb=clip_emb,
+                # Reuse the metrics already computed in quality.assess so the
+                # mundane heuristic isn't recomputed, and so its CLIP-unavailable
+                # fallback can gate on tonal detail.
+                mundane_heuristic=q.mundane_score,
+                detail_stddev=q.detail_stddev,
+                # Accidental close-up gate (hand/skin against lens) — reuse the
+                # flesh fraction + blur already computed in quality.assess.
+                filter_accidental_closeup=p_cfg.get("filter_accidental_closeup", True),
+                flesh_fraction=q.flesh_fraction,
+                blur_score=q.blur_score,
+                min_flesh_fraction=p_cfg.get("min_flesh_fraction", 0.65),
+                max_accidental_blur_score=p_cfg.get("max_accidental_blur_score", 120.0),
+                # Pitch-black / pure-white gate — reuses exposure + detail
+                # already computed in quality.assess.
+                filter_pitch_black=p_cfg.get("filter_pitch_black", True),
+                exposure_score=q.exposure_score,
             )
 
             database.upsert(conn, {
@@ -206,8 +252,12 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                 "exposure_score": q.exposure_score,
                 "resolution": q.resolution,
                 "quality_pass": int(q.passes),
+                "detail_stddev": q.detail_stddev,
+                "flesh_fraction": q.flesh_fraction,
+                "mundane_score": q.mundane_score,
                 "clip_emb": database.emb_to_blob(clip_emb),
                 "phash": phash_str,
+                "phash2": phash2_str,
                 "face_count": face_count,
                 "face_emb": database.emb_to_blob(face_emb),
                 "face_prominence": face_prominence,
@@ -391,7 +441,12 @@ def stage_reassess_privacy(cfg: dict, db_path: str) -> None:
             reshared_prefixes=p_cfg.get("reshared_prefixes"),
             filter_text_heavy=p_cfg.get("filter_text_heavy", True),
             filter_boring_objects=p_cfg.get("filter_boring_objects", True),
+            mundane_object_threshold=p_cfg.get("mundane_object_threshold", 0.62),
             filter_intimate_content=p_cfg.get("filter_intimate_content", True),
+            filter_accidental_closeup=p_cfg.get("filter_accidental_closeup", True),
+            min_flesh_fraction=p_cfg.get("min_flesh_fraction", 0.65),
+            max_accidental_blur_score=p_cfg.get("max_accidental_blur_score", 120.0),
+            filter_pitch_black=p_cfg.get("filter_pitch_black", True),
         )
     print(f"  Privacy re-assessed: {total} photos, {changed} updated")
 
@@ -414,11 +469,31 @@ def stage_dedup(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
                 "path":       r["path"],
                 "file_hash":  r["file_hash"],
                 "phash":      r["phash"],
+                "phash2":     r["phash2"],
+                "timestamp":  r["timestamp"],
+                "file_size":  r["file_size"],
                 "clip_emb":   database.blob_to_emb(r["clip_emb"]),
                 "blur_score": r["blur_score"],
             }
             for r in rows
         ]
+
+    dual_cfg = dup_cfg.get("dual_hash") or {}
+    dual_enabled = bool(dual_cfg.get("enabled", False))
+    secondary_threshold = int(dual_cfg.get("secondary_threshold", 8))
+
+    # Dual-hash needs phash2 populated at ingest. If the gate was enabled
+    # after ingest (no re-run of stage_extract), every phash2 is empty and the
+    # secondary Hamming distance is always 64 — the confirmation would veto
+    # EVERY pHash match and silently disable near-duplicate detection. Fall
+    # back to primary-only with a loud warning instead.
+    if dual_enabled and not any(r["phash2"] for r in records):
+        print(
+            "  WARNING: dual_hash is enabled but no photo has a secondary "
+            "hash. Re-run ingest (stage 2) to populate phash2; falling back "
+            "to single-hash matching for this run."
+        )
+        dual_enabled = False
 
     if store.clip_count() > 0:
         dup_paths = deduplication.find_duplicates_ann(
@@ -426,6 +501,8 @@ def stage_dedup(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
             store,
             phash_threshold=dup_cfg["phash_threshold"],
             embedding_threshold=dup_cfg["embedding_similarity"],
+            dual_hash=dual_enabled,
+            secondary_threshold=secondary_threshold,
         )
     else:
         # Fallback: brute-force O(N²) scan (small libraries or first run)
@@ -433,7 +510,22 @@ def stage_dedup(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
             records,
             phash_threshold=dup_cfg["phash_threshold"],
             embedding_threshold=dup_cfg["embedding_similarity"],
+            dual_hash=dual_enabled,
+            secondary_threshold=secondary_threshold,
         )
+
+    # Burst-shot dedup (EXIF-timestamp proximity): keep the sharpest frame of
+    # each rapid-fire sequence. Runs independently of the pHash/CLIP pass and
+    # the two duplicate sets are unioned.
+    burst_cfg = dup_cfg.get("burst") or {}
+    burst_extra = 0
+    if burst_cfg.get("enabled", True):
+        burst_paths = deduplication.find_burst_duplicates(
+            records,
+            gap_seconds=float(burst_cfg.get("gap_seconds", 3.0)),
+        )
+        burst_extra = len(burst_paths - dup_paths)
+        dup_paths = dup_paths | burst_paths
 
     with database.connect(db_path) as conn:
         # Reset all before applying new flags to make stage idempotent
@@ -442,7 +534,10 @@ def stage_dedup(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
             database.update_fields(conn, p, is_duplicate=1)
         conn.commit()
 
-    print(f"  Marked {len(dup_paths)} duplicates")
+    if burst_extra:
+        print(f"  Marked {len(dup_paths)} duplicates ({burst_extra} from burst detection)")
+    else:
+        print(f"  Marked {len(dup_paths)} duplicates")
     return len(dup_paths)
 
 
@@ -746,6 +841,16 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: 
         if output_mode == "percentage" else ""
     )
     print(f"  Selected {len(selected)} photos{pct_label}")
+
+    # Persist the selection flag so the cache reflects the final pick (lets a
+    # later --from-stage run or report regeneration read it back). Reset then
+    # set keeps the stage idempotent.
+    selected_paths = {rec["path"] for rec in selected}
+    with database.connect(db_path) as conn:
+        conn.execute("UPDATE photos SET selected=0")
+        for path in selected_paths:
+            database.update_fields(conn, path, selected=1)
+        conn.commit()
 
     if not dry_run:
         selection.copy_to_output(

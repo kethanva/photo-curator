@@ -47,9 +47,18 @@ def init_db(db_path: str) -> None:
                 exposure_score  REAL    DEFAULT 0.5,
                 resolution      INTEGER DEFAULT 0,
                 quality_pass    INTEGER DEFAULT 1,
+                -- cheap per-pixel metrics persisted so privacy gates can be
+                -- replayed from cache (stage_reassess_privacy) without
+                -- re-decoding images. -1 = not computed (pre-migration row).
+                detail_stddev   REAL    DEFAULT -1,
+                flesh_fraction  REAL    DEFAULT -1,
+                mundane_score   REAL    DEFAULT -1,
                 -- features (binary blobs)
                 clip_emb        BLOB,
                 phash           TEXT    DEFAULT '',
+                -- secondary perceptual hash (dual-hash confirmation gate);
+                -- empty unless deduplication.dual_hash is enabled at ingest
+                phash2          TEXT    DEFAULT '',
                 -- face
                 face_count      INTEGER DEFAULT 0,
                 face_emb        BLOB,
@@ -91,6 +100,14 @@ def init_db(db_path: str) -> None:
         # combined crop-alignment + largest-face fixes. main.stage_refresh_
         # face_embeddings re-extracts those rows on the next pipeline run.
         _add_column_if_missing(conn, "photos", "face_emb_version", "INTEGER DEFAULT 0")
+        # Secondary perceptual hash for the dual-hash confirmation gate.
+        _add_column_if_missing(conn, "photos", "phash2", "TEXT DEFAULT ''")
+        # Cheap per-pixel metrics for cache-replayable privacy gates.
+        # -1 sentinel = not computed at ingest (row predates these columns);
+        # reassess must skip gates whose inputs are sentinels.
+        _add_column_if_missing(conn, "photos", "detail_stddev",  "REAL DEFAULT -1")
+        _add_column_if_missing(conn, "photos", "flesh_fraction", "REAL DEFAULT -1")
+        _add_column_if_missing(conn, "photos", "mundane_score",  "REAL DEFAULT -1")
 
 
 def _add_column_if_missing(

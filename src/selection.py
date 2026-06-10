@@ -55,6 +55,21 @@ _BUILTIN_BUCKETS = {"people", "location", "aesthetic"}
 # Resizing helper
 # ---------------------------------------------------------------------------
 
+def _register_heif_opener() -> None:
+    """Register the pillow-heif opener so HEIC/HEIF sources open here.
+
+    The output stage re-opens originals from disk. On a full run ingestion
+    already registered the opener process-wide, but on a stage resume
+    (``--from-stage N`` with N > 2) ingestion never ran, so HEIC selections
+    would silently fail to open. Registering here is idempotent and cheap.
+    """
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except ImportError:
+        pass  # HEIC support absent — non-HEIC outputs still work.
+
+
 def _resize_and_save(
     src: Path,
     dst: Path,
@@ -225,7 +240,12 @@ def select_photos(
     # 11 eligible → only 5 selected after diversity caps). Note that
     # blur-failed photos were filtered above; only exposure / resolution
     # failures can reach this fallback admission.
-    pool_floor_base = total_photos if total_photos > 0 else len(eligible)
+    # Floor is a fraction of the photos that can actually enter the pool
+    # (post hard-gate: privacy + dedup + blur already removed). Using the raw
+    # scanned count (total_photos) would inflate the floor with photos that
+    # can never be admitted, forcing near-total admission of quality-fail
+    # photos on libraries with many private/duplicate/blurred shots.
+    pool_floor_base = len(eligible)
     pool_floor = int(pool_floor_base * min_pool_fraction)
     candidates = list(strict_candidates)
     if min_pool_fraction > 0.0 and len(candidates) < pool_floor and fallback_candidates:
@@ -401,6 +421,10 @@ def select_photos(
     # ts > 0). Maintained by ``_add`` so ``_too_close_globally`` can use
     # bisect for O(log k) lookup instead of scanning every selected record.
     selected_timestamps: List[float] = []
+    # Per-cluster sorted timestamp index — lets the per-cluster dynamic
+    # spacing check use bisect (O(log k)) instead of scanning every selected
+    # record (O(k)) on each insert, which was an O(n²) cliff at 10k+ outputs.
+    cluster_selected_ts: Dict[int, List[float]] = defaultdict(list)
     used_bytes: int = 0
     hour_counts: Dict[int, int] = defaultdict(int)
     day_counts: Dict[int, int] = defaultdict(int)
@@ -448,11 +472,17 @@ def select_photos(
         if ts > 0 and cid >= 0:
             req_spacing = cluster_dynamic_spacing.get(cid, 0.0)
             if req_spacing > 0:
-                for sel_rec in selected:
-                    if sel_rec.get("cluster_id", -1) == cid:
-                        sel_ts = sel_rec.get("timestamp", 0) or 0
-                        if sel_ts > 0 and abs(ts - sel_ts) < req_spacing:
-                            return False
+                cts = cluster_selected_ts.get(cid)
+                if cts:
+                    # Nearest already-selected timestamp in this cluster, both
+                    # sides of the insertion point. req_spacing may be inf
+                    # (very short burst → keep only one), which rejects any
+                    # neighbour, matching the prior abs()-scan semantics.
+                    j = bisect.bisect_left(cts, ts)
+                    if j < len(cts) and cts[j] - ts < req_spacing:
+                        return False
+                    if j > 0 and ts - cts[j - 1] < req_spacing:
+                        return False
 
         # Global timeline-proximity guard — independent of cluster_id.
         # Catches burst photos that DBSCAN split across clusters or dropped
@@ -484,6 +514,8 @@ def select_photos(
         # contribute to the proximity check.
         if ts > 0:
             bisect.insort(selected_timestamps, ts)
+            if cid >= 0:
+                bisect.insort(cluster_selected_ts[cid], ts)
         if max_per_day_n is not None:
             day_counts[_day_key(rec)] += 1
         if max_per_hour_n is not None:
@@ -662,6 +694,10 @@ def copy_to_output(
     When resize=True, photos are resized to long_side and saved as JPEG,
     significantly reducing file sizes while preserving visual quality.
     """
+    # Ensure HEIC/HEIF originals open here too — ingestion may not have run
+    # this process (stage resume), so don't rely on its global registration.
+    _register_heif_opener()
+
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 

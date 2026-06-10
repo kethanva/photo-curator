@@ -193,3 +193,178 @@ class TestFindDuplicates:
     def test_returns_set(self):
         result = find_duplicates([_record("a.jpg")])
         assert isinstance(result, set)
+
+
+# ---------------------------------------------------------------------------
+# Alternative hash algorithms (#4)
+# ---------------------------------------------------------------------------
+
+class TestHashAlgorithms:
+    def test_dhash_and_phash_both_valid_hex(self):
+        img = Image.new("RGB", (64, 64), color=(120, 60, 30))
+        ph = compute_phash(img, "phash")
+        dh = compute_phash(img, "dhash")
+        ah = compute_phash(img, "ahash")
+        assert all(isinstance(h, str) and len(h) == 16 for h in (ph, dh, ah))
+
+    def test_unknown_algorithm_falls_back_to_phash(self):
+        img = Image.new("RGB", (64, 64), color=(120, 60, 30))
+        assert compute_phash(img, "nope") == compute_phash(img, "phash")
+
+    def test_algorithms_differ_on_structured_image(self):
+        arr = np.zeros((64, 64, 3), dtype=np.uint8)
+        arr[:32] = 255  # top half white, bottom black
+        img = Image.fromarray(arr, "RGB")
+        # dhash (gradient) and ahash (average) encode different structure.
+        assert compute_phash(img, "dhash") != compute_phash(img, "ahash")
+
+
+# ---------------------------------------------------------------------------
+# Dual-hash confirmation gate (#3)
+# ---------------------------------------------------------------------------
+
+from src.deduplication import _is_phash_dup, find_burst_duplicates
+
+
+def _drec(path, *, blur=100.0, phash="", phash2="", ts=0.0, size=0):
+    return {"path": path, "blur_score": blur, "file_hash": "",
+            "phash": phash, "phash2": phash2, "timestamp": ts,
+            "file_size": size, "clip_emb": None}
+
+
+class TestDualHashGate:
+    # primary within threshold, secondary far apart
+    A = _drec("a", phash="0000000000000000", phash2="0000000000000000")
+    B = _drec("b", phash="0000000000000001", phash2="ffffffffffffffff")
+
+    def test_primary_match_no_dual_is_dup(self):
+        assert _is_phash_dup(self.B, self.A, 8, dual_hash=False, secondary_threshold=8) is True
+
+    def test_dual_blocks_when_secondary_disagrees(self):
+        assert _is_phash_dup(self.B, self.A, 8, dual_hash=True, secondary_threshold=8) is False
+
+    def test_dual_allows_when_secondary_agrees(self):
+        b = _drec("b", phash="0000000000000001", phash2="0000000000000001")
+        assert _is_phash_dup(b, self.A, 8, dual_hash=True, secondary_threshold=8) is True
+
+    def test_bktree_matches_brute_force(self):
+        """BK-tree radius queries must return exactly the same matches as a
+        brute-force Hamming scan, for several thresholds."""
+        import random
+
+        from src.deduplication import _BKTree, hamming_distance
+
+        rng = random.Random(42)
+        hashes = [f"{rng.getrandbits(64):016x}" for _ in range(300)]
+
+        tree = _BKTree()
+        for h in hashes:
+            tree.insert(h, h)
+
+        for tol in (0, 2, 8, 16):
+            for q in hashes[:25]:
+                expected = sorted(
+                    h for h in hashes if hamming_distance(q, h) <= tol
+                )
+                assert sorted(tree.search(q, tol)) == expected
+
+    def test_bktree_isolates_hash_lengths(self):
+        """Hashes of different hex lengths never cross-match (the Hamming
+        metric is only defined for equal lengths)."""
+        from src.deduplication import _BKTree
+
+        tree = _BKTree()
+        tree.insert("0" * 16, "len16")
+        tree.insert("0" * 8, "len8")
+        assert tree.search("0" * 16, 64) == ["len16"]
+        assert tree.search("0" * 8, 64) == ["len8"]
+
+    def test_bktree_ignores_empty_and_invalid(self):
+        from src.deduplication import _BKTree
+
+        tree = _BKTree()
+        tree.insert("", "empty")
+        tree.insert("zzzz", "invalid")
+        tree.insert("0" * 16, "good")
+        assert tree.search("0" * 16, 64) == ["good"]
+        assert tree.search("", 64) == []
+        assert tree.search("zzzz", 64) == []
+
+    def test_missing_secondary_falls_back_to_primary(self):
+        # One side ingested before dual_hash was enabled → phash2 empty.
+        # Secondary check is inconclusive, primary verdict must stand —
+        # an empty hash must NOT veto the match (hamming would be 64).
+        old = _drec("old", phash="0000000000000000", phash2="")
+        new = _drec("new", phash="0000000000000001", phash2="0000000000000001")
+        assert _is_phash_dup(new, old, 8, dual_hash=True, secondary_threshold=8) is True
+        assert _is_phash_dup(old, new, 8, dual_hash=True, secondary_threshold=8) is True
+
+    def test_find_duplicates_dual_hash_prevents_false_positive(self):
+        recs = [self.A, self.B]
+        # Without dual: B is a pHash dup of A.
+        assert find_duplicates(recs, phash_threshold=8, dual_hash=False) == {"b"}
+        # With dual: secondary disagrees → no dup marked.
+        assert find_duplicates(recs, phash_threshold=8, dual_hash=True,
+                               secondary_threshold=8) == set()
+
+
+# ---------------------------------------------------------------------------
+# Burst-shot dedup (#2)
+# ---------------------------------------------------------------------------
+
+class TestBurstDuplicates:
+    def test_keeps_sharpest_of_burst(self):
+        recs = [
+            _drec("a", blur=10.0, ts=1000.0),
+            _drec("b", blur=90.0, ts=1001.0),   # sharpest → keeper
+            _drec("c", blur=50.0, ts=1002.5),
+        ]
+        assert find_burst_duplicates(recs, gap_seconds=3.0) == {"a", "c"}
+
+    def test_gap_splits_into_separate_bursts(self):
+        recs = [
+            _drec("a", blur=10.0, ts=1000.0),
+            _drec("b", blur=90.0, ts=1001.0),   # burst 1 keeper
+            _drec("c", blur=20.0, ts=1010.0),   # burst 2 (gap 9s > 3s)
+            _drec("d", blur=80.0, ts=1011.0),   # burst 2 keeper
+        ]
+        assert find_burst_duplicates(recs, gap_seconds=3.0) == {"a", "c"}
+
+    def test_singletons_never_marked(self):
+        recs = [
+            _drec("a", ts=1000.0),
+            _drec("b", ts=1100.0),
+            _drec("c", ts=1200.0),
+        ]
+        assert find_burst_duplicates(recs, gap_seconds=3.0) == set()
+
+    def test_records_without_timestamp_skipped(self):
+        recs = [
+            _drec("a", blur=10.0, ts=0.0),    # no EXIF
+            _drec("b", blur=90.0, ts=0.0),    # no EXIF
+        ]
+        assert find_burst_duplicates(recs, gap_seconds=3.0) == set()
+
+    def test_gap_boundary_exclusive(self):
+        # gap exactly == gap_seconds stays in the same burst (only > splits).
+        recs = [
+            _drec("a", blur=10.0, ts=1000.0),
+            _drec("b", blur=90.0, ts=1003.0),  # gap 3.0, not > 3.0
+        ]
+        assert find_burst_duplicates(recs, gap_seconds=3.0) == {"a"}
+
+    def test_blur_tie_breaks_on_file_size(self):
+        # Equal sharpness (e.g. both 0.0 after a metric failure) → keep the
+        # larger file, mirroring photos-cleanup compute_best tie-break.
+        recs = [
+            _drec("small", blur=0.0, ts=1000.0, size=100),
+            _drec("large", blur=0.0, ts=1001.0, size=900),
+        ]
+        assert find_burst_duplicates(recs, gap_seconds=3.0) == {"small"}
+
+    def test_sharpness_beats_file_size(self):
+        recs = [
+            _drec("sharp_small", blur=90.0, ts=1000.0, size=100),
+            _drec("blurry_large", blur=10.0, ts=1001.0, size=900),
+        ]
+        assert find_burst_duplicates(recs, gap_seconds=3.0) == {"blurry_large"}
