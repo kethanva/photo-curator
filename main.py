@@ -203,7 +203,7 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                 if dual_enabled else ""
             )
             face_count, face_emb, face_prominence, face_confidence = face_detection.detect(img)
-            is_priv    = privacy.assess(
+            is_priv, priv_reason = privacy.assess_with_reason(
                 img=img,
                 camera_model=exif["camera_model"],
                 has_gps=exif["has_gps"],
@@ -264,6 +264,7 @@ def stage_extract(cfg: dict, paths, db_path: str, store: "vs.VectorStore") -> No
                 "face_confidence": face_confidence,
                 "face_emb_version": face_detection.FACE_EMB_VERSION,
                 "is_private": int(is_priv),
+                "private_reason": priv_reason,
                 "processed_at": time.time(),
             })
 
@@ -343,7 +344,15 @@ def stage_aesthetic(cfg: dict, db_path: str) -> None:
 
 
 def stage_scene(cfg: dict, db_path: str) -> None:
-    """Stage 4: Zero-shot scene classification from stored CLIP embeddings."""
+    """Stage 4: Zero-shot scene classification from stored CLIP embeddings.
+
+    Scene tags are report-only metadata — ranking and selection don't read
+    them (subject buckets use subject_priority CLIP scoring instead), so the
+    stage honours the ``scene_tagging.enabled`` config flag to save compute.
+    """
+    if not cfg.get("scene_tagging", {}).get("enabled", True):
+        print("  Scene tagging disabled — skipping")
+        return
     top_n = cfg.get("scene_tagging", {}).get("top_n", 3)
 
     with database.connect(db_path) as conn:
@@ -448,7 +457,18 @@ def stage_reassess_privacy(cfg: dict, db_path: str) -> None:
             max_accidental_blur_score=p_cfg.get("max_accidental_blur_score", 120.0),
             filter_pitch_black=p_cfg.get("filter_pitch_black", True),
         )
+        # Per-gate breakdown — makes high exclusion rates auditable at a
+        # glance instead of a single opaque is_private count.
+        reason_rows = conn.execute(
+            "SELECT private_reason, COUNT(*) FROM photos "
+            "WHERE is_private=1 GROUP BY private_reason ORDER BY COUNT(*) DESC"
+        ).fetchall()
     print(f"  Privacy re-assessed: {total} photos, {changed} updated")
+    if reason_rows:
+        breakdown = ", ".join(
+            f"{(r[0] or 'unrecorded')}={r[1]}" for r in reason_rows
+        )
+        print(f"  Private by gate: {breakdown}")
 
 
 def stage_dedup(cfg: dict, db_path: str, store: "vs.VectorStore") -> int:
@@ -802,7 +822,10 @@ def stage_rank_and_select(cfg: dict, db_path: str, dry_run: bool, total_photos: 
             bucket_subject_scores[name] = subject_priority.score_single_subject(
                 records, name,
             )
-            matched = sum(1 for v in bucket_subject_scores[name].values() if v > 0.15)
+            matched = sum(
+                1 for v in bucket_subject_scores[name].values()
+                if v >= selection.SUBJECT_MATCH_THRESHOLD
+            )
             print(f"    {name}: {matched}/{len(records)} photos matched")
 
     # ── Select ────────────────────────────────────────────────────

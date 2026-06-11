@@ -82,7 +82,11 @@ clustering:
 
 # ── Aesthetic Scoring ───────────────────────────────────────────────────────
 aesthetic:
-  use_laion_predictor: false  # true = download LAION MLP (more accurate)
+  use_laion_predictor: false  # true = download LAION MLP. NOTE: the published
+                               # weights target CLIP ViT-L/14 (768-dim) and are
+                               # incompatible with this pipeline's ViT-B/32
+                               # embeddings — the loader detects this and falls
+                               # back to CLIP zero-shot with a warning.
                                # false = CLIP zero-shot proxy (instant, offline)
 
 # ── Scene Tagging ───────────────────────────────────────────────────────────
@@ -98,17 +102,19 @@ sentiment:
 # ── Ranking weights ──────────────────────────────────────────────────────────
 # Weights sum to 1.0 for interpretability but are not required to.
 # Face-related signals (face_score + face_prominence + face_confidence + sentiment)
-# now total 0.51 — photos with clear, smiling, prominent faces rank highest.
-# Aesthetic weight reduced from 0.35 to 0.20 to prevent landscape/architectural
-# photos from drowning out people photos.
+# total 0.61 — photos with clear, smiling, prominent faces rank highest.
+# Aesthetic weight reduced 0.20 → 0.05: empirically the CLIP zero-shot
+# aesthetic proxy has almost no dynamic range (whole-library spread ~0.49–0.51),
+# so min-max normalisation was amplifying noise into 20% of the score.
+# Redistributed to sharpness/face/sentiment, which carry real signal.
 ranking:
   weights:
-    sharpness:           0.10
-    aesthetic:           0.20   # CLIP / LAION aesthetic score
-    face_score:          0.18   # log-scaled face count
+    sharpness:           0.15
+    aesthetic:           0.05   # CLIP zero-shot proxy — weak signal, low weight
+    face_score:          0.23   # log-scaled face count
     face_prominence:     0.10   # face bounding-box area / image area
     face_confidence:     0.05   # MTCNN detection probability
-    sentiment:           0.18   # smile + eyes open (MediaPipe)
+    sentiment:           0.23   # smile + eyes open (MediaPipe)
     uniqueness:          0.10
     metadata_importance: 0.05
     diversity_bonus:     0.04
@@ -130,7 +136,9 @@ selection:
   #   bytes       → fill up to max_output_bytes (1 GB default)
   # Both modes still apply the byte cap as a hard upper limit.
   output_mode: percentage       # 'percentage' or 'bytes'
-  output_percentage: 0.20       # 20 % of eligible photos (output_mode=percentage)
+  output_percentage: 0.20       # 20 % of ALL scanned input photos (incl. those
+                                # later excluded as private/duplicate/blurry);
+                                # capped at the eligible candidate count
   max_output_bytes: 1_073_741_824   # 1 GB hard cap (always enforced)
 
   # Bucket fractions (auto-normalised to sum to 1.0)

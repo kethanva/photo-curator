@@ -103,7 +103,9 @@ def score_photos(
     uniqueness = _minmax(uniqueness_raw)
 
     # ── Metadata importance ──────────────────────────────────────
-    meta = np.array(
+    # Min-maxed like every other component so its raw range (0.24–1.0)
+    # doesn't give it a hidden baseline advantage in the weighted sum.
+    meta_raw = np.array(
         [
             (1.0 if r.get("has_gps", 0) else 0.4)
             * (1.0 if r.get("timestamp", 0.0) > 0 else 0.6)
@@ -111,6 +113,7 @@ def score_photos(
         ],
         dtype=float,
     )
+    meta = _minmax(meta_raw)
 
     # ── Diversity bonus ──────────────────────────────────────────
     # Rewards photos from well-formed event clusters (weddings, trips) without

@@ -67,6 +67,9 @@ def init_db(db_path: str) -> None:
                 -- flags
                 is_duplicate    INTEGER DEFAULT 0,
                 is_private      INTEGER DEFAULT 0,
+                -- which privacy gate flagged the photo ('' = not private);
+                -- makes the 60%+ exclusion rates auditable per-photo
+                private_reason  TEXT    DEFAULT '',
                 -- output stages
                 cluster_id      INTEGER DEFAULT -1,
                 score           REAL    DEFAULT 0,
@@ -108,6 +111,9 @@ def init_db(db_path: str) -> None:
         _add_column_if_missing(conn, "photos", "detail_stddev",  "REAL DEFAULT -1")
         _add_column_if_missing(conn, "photos", "flesh_fraction", "REAL DEFAULT -1")
         _add_column_if_missing(conn, "photos", "mundane_score",  "REAL DEFAULT -1")
+        # Audit trail for privacy exclusions — name of the gate that flagged
+        # the photo. Empty string = not private (or pre-migration row).
+        _add_column_if_missing(conn, "photos", "private_reason", "TEXT DEFAULT ''")
 
 
 def _add_column_if_missing(

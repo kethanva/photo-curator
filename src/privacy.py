@@ -821,7 +821,8 @@ def reassess_is_private_from_cache(
     from src import database
 
     rows = conn.execute(
-        "SELECT path, clip_emb, is_private, camera_model, has_gps, face_count, "
+        "SELECT path, clip_emb, is_private, private_reason, camera_model, "
+        "has_gps, face_count, "
         "blur_score, exposure_score, detail_stddev, flesh_fraction "
         "FROM photos"
     ).fetchall()
@@ -831,6 +832,7 @@ def reassess_is_private_from_cache(
         path = row["path"]
         clip_emb = database.blob_to_emb(row["clip_emb"])
         prev = int(row["is_private"])
+        prev_reason = str(row["private_reason"] or "")
 
         if clip_emb is None:
             continue
@@ -869,10 +871,26 @@ def reassess_is_private_from_cache(
             and is_pitch_black_or_pure_white(exposure, detail)
         )
 
-        new_flag_from_cache = bool(
-            doc_hit or reshared_hit or text_hit or boring_hit or intimate_hit
-            or closeup_hit or pitch_hit
-        )
+        # First gate that fired, in the same precedence order as
+        # assess_with_reason — persisted so exclusions stay auditable.
+        if reshared_hit:
+            cache_reason = "reshared_filename"
+        elif closeup_hit:
+            cache_reason = "accidental_closeup"
+        elif pitch_hit:
+            cache_reason = "pitch_black_or_pure_white"
+        elif doc_hit:
+            cache_reason = "document"
+        elif text_hit:
+            cache_reason = "text_heavy"
+        elif boring_hit:
+            cache_reason = "mundane_object"
+        elif intimate_hit:
+            cache_reason = "intimate_content"
+        else:
+            cache_reason = ""
+
+        new_flag_from_cache = bool(cache_reason)
 
         # Reassessment only sees CLIP-recomputable + filename signals. Two other
         # rules (is_screenshot — needs original image dims; is_home_private —
@@ -884,6 +902,7 @@ def reassess_is_private_from_cache(
         # screenshots / home-private hits we can't recompute from cache.
         if new_flag_from_cache:
             final_flag = 1
+            final_reason = cache_reason
         elif prev:
             camera_model = (row["camera_model"] or "").strip()
             has_gps = int(row["has_gps"] or 0)
@@ -891,16 +910,25 @@ def reassess_is_private_from_cache(
             has_real_photo_signal = (
                 bool(camera_model) or has_gps > 0 or face_count > 0
             )
-            final_flag = 0 if has_real_photo_signal else 1
+            if has_real_photo_signal:
+                final_flag = 0
+                final_reason = ""
+            else:
+                final_flag = 1
+                # Keep the original ingest-time reason if recorded; otherwise
+                # mark it as a non-replayable gate preserved from ingest.
+                final_reason = prev_reason or "preserved_from_ingest"
         else:
             final_flag = 0
+            final_reason = ""
 
-        if final_flag != prev:
+        if final_flag != prev or final_reason != prev_reason:
             conn.execute(
-                "UPDATE photos SET is_private=? WHERE path=?",
-                (final_flag, path),
+                "UPDATE photos SET is_private=?, private_reason=? WHERE path=?",
+                (final_flag, final_reason, path),
             )
-            changed += 1
+            if final_flag != prev:
+                changed += 1
 
     # NOTE: commit is the caller's responsibility — this function is invoked
     # under a ``with database.connect(...) as conn`` block in main.py which
@@ -978,21 +1006,91 @@ def assess(
     """
     Return True if the photo should be excluded from the curated output.
 
+    Thin wrapper over :func:`assess_with_reason` for callers that don't need
+    the audit reason.
+    """
+    return assess_with_reason(
+        img=img,
+        camera_model=camera_model,
+        has_gps=has_gps,
+        lat=lat,
+        lon=lon,
+        face_count=face_count,
+        home=home,
+        home_radius_km=home_radius_km,
+        filter_screenshots=filter_screenshots,
+        filter_documents=filter_documents,
+        filter_text_heavy=filter_text_heavy,
+        filter_boring_objects=filter_boring_objects,
+        mundane_object_threshold=mundane_object_threshold,
+        filter_intimate_content=filter_intimate_content,
+        filter_home_private=filter_home_private,
+        filter_reshared=filter_reshared,
+        path=path,
+        reshared_prefixes=reshared_prefixes,
+        clip_emb=clip_emb,
+        mundane_heuristic=mundane_heuristic,
+        detail_stddev=detail_stddev,
+        filter_accidental_closeup=filter_accidental_closeup,
+        flesh_fraction=flesh_fraction,
+        blur_score=blur_score,
+        min_flesh_fraction=min_flesh_fraction,
+        max_accidental_blur_score=max_accidental_blur_score,
+        filter_pitch_black=filter_pitch_black,
+        exposure_score=exposure_score,
+    )[0]
+
+
+def assess_with_reason(
+    img: Image.Image,
+    camera_model: str,
+    has_gps: bool,
+    lat: float,
+    lon: float,
+    face_count: int,
+    home: Optional[Tuple[float, float]],
+    home_radius_km: float,
+    filter_screenshots: bool = True,
+    filter_documents: bool = True,
+    filter_text_heavy: bool = True,
+    filter_boring_objects: bool = True,
+    mundane_object_threshold: float = 0.62,
+    filter_intimate_content: bool = True,
+    filter_home_private: bool = False,
+    filter_reshared: bool = True,
+    path: Optional[Union[str, Path]] = None,
+    reshared_prefixes: Optional[Iterable[str]] = None,
+    clip_emb: Optional[np.ndarray] = None,
+    mundane_heuristic: float = 0.0,
+    detail_stddev: float = 0.0,
+    filter_accidental_closeup: bool = True,
+    flesh_fraction: float = 0.0,
+    blur_score: float = float("inf"),
+    min_flesh_fraction: float = 0.65,
+    max_accidental_blur_score: float = 120.0,
+    filter_pitch_black: bool = True,
+    exposure_score: float = 0.5,
+) -> Tuple[bool, str]:
+    """
+    Return ``(is_private, reason)``. ``reason`` names the first gate that
+    flagged the photo ('' when not private) and is persisted to the DB so
+    aggressive exclusion rates can be audited per-gate after a run.
+
     Checks are ordered cheapest-first to avoid unnecessary model calls.
     When a pre-computed CLIP embedding is supplied the document check reuses
     it instead of running CLIP a second time on the same image.
     """
     if filter_reshared and path is not None and is_reshared_filename(path, reshared_prefixes):
-        return True
+        return True, "reshared_filename"
     if filter_screenshots and is_screenshot(img, camera_model, has_gps):
-        return True
+        return True, "screenshot"
     # Accidental close-up (hand/skin against lens). Pure-image, no model — the
     # flesh fraction and blur score are precomputed in quality.assess and passed
     # in. blur_score defaults to +inf so a caller that omits it never trips this.
     if filter_accidental_closeup and is_accidental_closeup(
         flesh_fraction, blur_score, min_flesh_fraction, max_accidental_blur_score
     ):
-        return True
+        return True, "accidental_closeup"
     # Pitch-black / pure-white frame (lens cap, pocket misfire, blown flash).
     # Hard-excluded here because the selection stage can re-admit exposure
     # failures via its fallback pool. exposure_score defaults to 0.5 (neutral)
@@ -1000,26 +1098,26 @@ def assess(
     if filter_pitch_black and is_pitch_black_or_pure_white(
         exposure_score, detail_stddev
     ):
-        return True
+        return True, "pitch_black_or_pure_white"
     if filter_home_private and is_home_private(lat, lon, face_count, home, home_radius_km):
-        return True
+        return True, "home_private"
     if filter_documents:
         if clip_emb is not None:
             if is_document_from_embedding(clip_emb):
-                return True
+                return True, "document"
         elif is_document_clip(img):
-            return True
+            return True, "document"
     # Binary text-heavy check — catches chat screenshots saved with camera filenames
     # that slip past the multi-class document detector due to probability dilution.
     if filter_text_heavy and clip_emb is not None:
         if is_text_heavy_from_embedding(clip_emb):
-            return True
+            return True, "text_heavy"
         # Structural backstop for camera photos of printed pages / calendars /
         # tables that CLIP misses (e.g. a phone shot of a wall calendar saved
         # as IMG_YYYYMMDD_HHMMSS.jpg). Runs only at ingest because it needs
         # the original image data — the cache reassess path can't replay it.
         if looks_like_text_document_page(img):
-            return True
+            return True, "text_document_page"
     # Boring / mundane object filter.
     if filter_boring_objects:
         if clip_emb is not None:
@@ -1031,9 +1129,9 @@ def assess(
             # those as nature/landscape and leaves them in, so when an
             # embedding is available we defer to it entirely.
             if is_boring_from_embedding(clip_emb):
-                return True
+                return True, "boring_object"
             if is_mundane_object_from_embedding(clip_emb, threshold=mundane_object_threshold):
-                return True
+                return True, "mundane_object"
         elif (
             mundane_heuristic >= 0.80
             and detail_stddev < _FLAT_FRAME_DETAIL_MAX
@@ -1044,9 +1142,9 @@ def assess(
             # subject-less frame — high uniformity AND no tonal detail AND no
             # detected face. Errs toward keeping ambiguous frames rather than
             # dropping them.
-            return True
+            return True, "mundane_heuristic"
     # Intimate content filter
     if filter_intimate_content and clip_emb is not None:
         if is_intimate_from_embedding(clip_emb):
-            return True
-    return False
+            return True, "intimate_content"
+    return False, ""
