@@ -90,6 +90,9 @@ def _build_prompt_vectors() -> None:
 # ---------------------------------------------------------------------------
 
 _laion_model = None
+# Latched True after a failed load (download error, incompatible weights) so
+# we don't retry torch.load / hf download once per photo on a 10k library.
+_laion_load_failed = False
 
 
 def _load_laion_predictor():
@@ -98,9 +101,11 @@ def _load_laion_predictor():
     Requires: pip install huggingface_hub torch
     Model: ~6 KB linear layer trained on AVA aesthetic ratings.
     """
-    global _laion_model
+    global _laion_model, _laion_load_failed
     if _laion_model is not None:
         return _laion_model
+    if _laion_load_failed:
+        return None
 
     import torch
     import torch.nn as nn
@@ -139,6 +144,7 @@ def _load_laion_predictor():
             shutil.move(downloaded, cache_path)
         except Exception as e:
             print(f"  Warning: could not download aesthetic model ({e}). Falling back to CLIP.")
+            _laion_load_failed = True
             return None
 
     try:
@@ -147,7 +153,24 @@ def _load_laion_predictor():
         # mitigates the documented torch.load RCE vector if the cached
         # .pth is replaced or tampered with on disk.
         state = torch.load(cache_path, map_location="cpu", weights_only=True)
-        m.load_state_dict(state, strict=False)
+        load_result = m.load_state_dict(state, strict=False)
+        # The published sac+logos+ava1-l14 weights target CLIP ViT-L/14
+        # (768-dim input, different MLP layer shapes). With strict=False a
+        # full mismatch silently loads NOTHING, leaving the MLP randomly
+        # initialised — every photo would get a garbage "aesthetic" score.
+        # Refuse and fall back to CLIP zero-shot instead.
+        if load_result.missing_keys or load_result.unexpected_keys:
+            logger.warning(
+                "LAION predictor weights at %s are incompatible with the "
+                "local 512-dim MLP (missing=%d, unexpected=%d keys) — they "
+                "likely target CLIP ViT-L/14 (768-dim) while this pipeline "
+                "uses ViT-B/32. Falling back to CLIP zero-shot scoring.",
+                cache_path,
+                len(load_result.missing_keys),
+                len(load_result.unexpected_keys),
+            )
+            _laion_load_failed = True
+            return None
         m.eval()
         _laion_model = m
         return m
@@ -156,6 +179,7 @@ def _load_laion_predictor():
             "LAION predictor load failed (%s); falling back to CLIP zero-shot.",
             exc,
         )
+        _laion_load_failed = True
         return None
 
 

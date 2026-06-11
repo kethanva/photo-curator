@@ -18,6 +18,13 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List
 
+# Minimum CLIP cosine similarity for a photo to count as a subject-bucket
+# match. Sits above the background similarity floor (~0.15–0.18 for
+# unrelated photos) so subject buckets pull genuine matches, not noise.
+# Shared with main.py's per-bucket match-count report so the printed
+# counts agree with what the bucket can actually admit.
+SUBJECT_MATCH_THRESHOLD = 0.20
+
 
 def fill_people_bucket(
     sorted_cands, selected_paths, _add, _budget_exhausted, _est_size,
@@ -68,6 +75,8 @@ def fill_location_bucket(
     for rec in sorted_cands:
         if _budget_exhausted():
             break
+        if photo_cap is not None and bucket_selected >= photo_cap:
+            break  # cap can only fill, never drain — no point iterating on
         if rec["path"] in selected_paths:
             continue
         cid = rec.get("cluster_id", -1)
@@ -77,8 +86,6 @@ def fill_location_bucket(
             continue
         pid = rec.get("person_id", -1)
         if pid >= 0 and person_counts[pid] >= max_per_person_n:
-            continue
-        if photo_cap is not None and bucket_selected >= photo_cap:
             continue
         est = _est_size(rec)
         if used + est > byte_budget:
@@ -99,20 +106,30 @@ def fill_subject_bucket(
     _day_key, _hour_key, day_counts, hour_counts,
     max_per_day_n, max_per_hour_n,
     subj_scores, byte_budget, photo_cap,
+    scores=None,
 ):
     """Fill a CLIP subject bucket.
 
-    Candidates are sorted by their subject similarity (descending) so the
-    best matches for this subject are picked first. Day/hour caps are
+    Candidates above ``SUBJECT_MATCH_THRESHOLD`` are ranked by subject
+    similarity × composite quality score (when ``scores`` is supplied), so
+    the bucket picks the best *photos* of the subject rather than the
+    strongest raw CLIP match regardless of quality. Day/hour caps are
     pre-checked here (matching fill_aesthetic_bucket) so saturated buckets
     don't burn iterations or inflate the per-bucket photo cap on rejected
     records.
     """
-    subj_sorted = sorted(
-        sorted_cands,
-        key=lambda r: subj_scores.get(r["path"], 0.0),
-        reverse=True,
-    )
+    # Filter to genuine matches first, then quality-weight the order.
+    matches = [
+        r for r in sorted_cands
+        if subj_scores.get(r["path"], 0.0) >= SUBJECT_MATCH_THRESHOLD
+    ]
+    if scores:
+        sort_key = lambda r: (
+            subj_scores.get(r["path"], 0.0) * scores.get(r["path"], 0.0)
+        )
+    else:
+        sort_key = lambda r: subj_scores.get(r["path"], 0.0)
+    subj_sorted = sorted(matches, key=sort_key, reverse=True)
 
     used = 0
     bucket_selected = 0
@@ -121,11 +138,6 @@ def fill_subject_bucket(
             break
         if rec["path"] in selected_paths:
             continue
-        # Skip photos with weak subject match. 0.20 sits above the
-        # background CLIP similarity floor (~0.15–0.18 for unrelated photos)
-        # so subject buckets pull genuine matches rather than noise.
-        if subj_scores.get(rec["path"], 0.0) < 0.20:
-            break  # sorted descending — rest will be even lower
         if max_per_day_n is not None and day_counts[_day_key(rec)] >= max_per_day_n:
             continue
         if max_per_hour_n is not None and hour_counts[_hour_key(rec)] >= max_per_hour_n:

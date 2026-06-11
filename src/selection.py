@@ -38,6 +38,7 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 from src.bucket_fillers import (
+    SUBJECT_MATCH_THRESHOLD,
     backfill_round_robin,
     fill_aesthetic_bucket,
     fill_location_bucket,
@@ -583,6 +584,7 @@ def select_photos(
                 _day_key, _hour_key, day_counts, hour_counts,
                 max_per_day_n, max_per_hour_n,
                 subj_scores, bucket_byte_budget, bucket_photo_cap,
+                scores=scores,
             )
 
     # ── Aesthetic share (always last) ────────────────────────────

@@ -13,7 +13,6 @@ from typing import Dict, List
 import numpy as np
 from sklearn.cluster import DBSCAN
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 
 
 _CLIP_DIM = 512
@@ -37,7 +36,24 @@ def _build_feature_matrix(
     # --- Scalar features ---
     scalars = np.zeros((n, 3), dtype=np.float32)
     min_ts = min((r.get("timestamp", 0.0) for r in records if r.get("timestamp", 0.0) > 0), default=0.0)
-    
+
+    # GPS imputation for photos with no fix: (0,0) literal would teleport
+    # them to null island, ~thousands of scaled units away from every real
+    # photo — a no-GPS shot could then never cluster with GPS'd shots from
+    # the same event. Placing them at the centroid of the photos that DO
+    # have GPS keeps them spatially neutral, letting time + visual features
+    # decide their cluster membership.
+    gps_records = [
+        (r.get("lat") or 0.0, r.get("lon") or 0.0)
+        for r in records
+        if (r.get("lat") or 0.0) != 0.0 or (r.get("lon") or 0.0) != 0.0
+    ]
+    if gps_records:
+        mean_lat = float(np.mean([g[0] for g in gps_records]))
+        mean_lon = float(np.mean([g[1] for g in gps_records]))
+    else:
+        mean_lat = mean_lon = 0.0
+
     for i, r in enumerate(records):
         ts = r.get("timestamp", 0.0)
         # Absolute scaling: 1 unit = 1 hour (3600 seconds)
@@ -48,10 +64,14 @@ def _build_feature_matrix(
             # Place photos missing timestamps infinitely far apart
             # so they never cluster based on time (singletons)
             scalars[i, 0] = 1_000_000.0 + (i * 100.0)
-        
+
         # Absolute spatial scaling: 1 unit = 0.01 degrees (~1.1 km)
-        scalars[i, 1] = (r.get("lat", 0.0) * 100.0) * gps_weight
-        scalars[i, 2] = (r.get("lon", 0.0) * 100.0) * gps_weight
+        lat = r.get("lat") or 0.0
+        lon = r.get("lon") or 0.0
+        if lat == 0.0 and lon == 0.0:
+            lat, lon = mean_lat, mean_lon
+        scalars[i, 1] = (lat * 100.0) * gps_weight
+        scalars[i, 2] = (lon * 100.0) * gps_weight
 
     # --- CLIP embeddings ---
     clip_matrix = np.zeros((n, _CLIP_DIM), dtype=np.float32)
