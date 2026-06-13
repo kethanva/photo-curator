@@ -309,9 +309,15 @@ def find_duplicates(
     Returns:
         Set of paths to mark as duplicates (the worse-quality copies).
     """
-    # Sharpest copy first — it will be the one that gets kept
+    # Sharpest copy first; ties broken on file size so the highest-fidelity
+    # copy survives among equally-sharp duplicates (re-encodes/resizes share a
+    # pHash but the larger file is the less-compressed original). Mirrors the
+    # (sharpness, pixels, file_size) keeper key in find_burst_duplicates and
+    # photos-cleanup selection.rs::compute_best.
     sorted_recs = sorted(
-        records, key=lambda r: r.get("blur_score", 0.0), reverse=True
+        records,
+        key=lambda r: (r.get("blur_score", 0.0) or 0.0, r.get("file_size", 0) or 0),
+        reverse=True,
     )
 
     to_remove: Set[str] = set()
@@ -384,8 +390,15 @@ def find_duplicates_ann(
     Returns:
         Set of paths to mark as duplicates (the worse-quality copies).
     """
+    # Sharpest copy first; ties broken on file size so the highest-fidelity
+    # copy survives among equally-sharp duplicates (re-encodes/resizes share a
+    # pHash but the larger file is the less-compressed original). Mirrors the
+    # (sharpness, pixels, file_size) keeper key in find_burst_duplicates and
+    # photos-cleanup selection.rs::compute_best.
     sorted_recs = sorted(
-        records, key=lambda r: r.get("blur_score", 0.0), reverse=True
+        records,
+        key=lambda r: (r.get("blur_score", 0.0) or 0.0, r.get("file_size", 0) or 0),
+        reverse=True,
     )
 
     to_remove: Set[str] = set()
